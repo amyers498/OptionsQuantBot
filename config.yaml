@@ -1,0 +1,60 @@
+env: "paper"
+timezone: "America/New_York"
+
+alpaca:
+  base_url_paper: "https://paper-api.alpaca.markets"
+  data_url: "https://data.alpaca.markets"
+  market_data_subscription: "iex" # or sip, if entitled
+
+universe:
+  top_n: 15        # pull 10–20 candidates daily
+  exclude: ["BIOTECH_X", "PENNY_Y"]  # optional blacklist
+
+signals:
+  sma_short: 20
+  sma_long: 50
+  iv_percentile_lookback_days: 90
+  iv_low_threshold_pctile: 30
+  iv_high_threshold_pctile: 70
+
+liquidity:
+  min_open_interest: 500
+  min_volume: 50
+  max_spread_pct: 0.10   # 10% of premium
+
+strategy:
+  expiry_min_days: 7
+  expiry_max_days: 21
+  single_delta_min: 0.35
+  single_delta_max: 0.55
+  spread_width_default: 5        # $ wide if implied-move not used
+  use_implied_move_for_cap: true # short leg near implied move
+
+risk:
+  account_size_assumed: 500
+  per_trade_dollar_min: 50
+  per_trade_dollar_max: 200
+  max_concurrent_positions: 4
+  daily_loss_limit_pct: 5
+  max_open_risk_pct_of_equity: 40
+
+exits:
+  time_stop_days_min: 3
+  time_stop_days_max: 5
+  single_profit_target_lo: 0.5     # +50%
+  single_profit_target_hi: 1.0     # +100%
+  single_hard_stop_pct: 0.5        # -50% of debit
+  spread_profit_target_pct_of_max: 0.7 # 70% of max value
+
+discord:
+  trades_webhook: "ENV:DISCORD_TRADES"
+  eod_webhook: "ENV:DISCORD_EOD"
+  color_bullish: 3066993     # green-ish
+  color_bearish: 15158332    # red-ish
+  color_neutral: 15844367    # yellow-ish
+
+scheduling:
+  premarket_cron: "0 8 * * 1-5"      # 8:00 ET
+  intraday_every_seconds: 120        # poll 2 min
+  eod_cron: "15 16 * * 1-5"          # 4:15 ET
+
