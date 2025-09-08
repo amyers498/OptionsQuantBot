@@ -18,7 +18,12 @@ from src.alpaca_client.account import AccountClient
 from src.alpaca_client.stream import probe_options_stream
 from src.notify.discord import build_info_embed, build_trade_new_embed, send_webhook
 from src.notify.discord import build_filled_embed, build_closed_embed
-from src.pnl.valuers import legs_current_value, spread_current_value, spread_width_from_legs, parse_occ_expiry
+from src.pnl.valuers import (
+    legs_current_value,
+    spread_current_value,
+    spread_width_from_legs,
+    parse_occ_expiry,
+)
 from src.features.trend import compute_sma20_50
 from src.features.liquidity import passes_liquidity
 from src.features.implied_move import implied_move_abs
@@ -85,6 +90,27 @@ def sync_broker_positions_to_db(cfg: Dict[str, Any]) -> int:
     except Exception:
         broker_opts = []
     if not broker_opts:
+        # Also close any DB OPEN positions that no longer exist at broker
+        try:
+            for session in get_session():
+                db_positions = session.query(Position).filter(Position.status == PositionStatus.OPEN).all()
+                for p in db_positions:
+                    occs = [leg.get('symbol') for leg in (p.legs_json or []) if isinstance(leg, dict) and leg.get('symbol')]
+                    if not occs:
+                        continue
+                    # If none of OCCs are in broker list, mark CLOSED
+                    in_broker = False
+                    for bp in (acct.options_positions() or []):
+                        boc = bp.get('symbol') or bp.get('option_symbol') or (bp.get('option_contract') or {}).get('symbol')
+                        if boc and boc in occs:
+                            in_broker = True
+                            break
+                    if not in_broker:
+                        p.status = PositionStatus.CLOSED
+                        p.closed_at = now_et()
+                break
+        except Exception:
+            pass
         return 0
 
     imported = 0
@@ -101,6 +127,10 @@ def sync_broker_positions_to_db(cfg: Dict[str, Any]) -> int:
             except Exception:
                 pass
 
+            # Helper to parse OCC fields
+            from src.pnl.valuers import parse_occ_strike, parse_occ_expiry
+
+            # First pass: import long singles
             for bp in broker_opts:
                 occ = (
                     bp.get('symbol')
@@ -144,6 +174,90 @@ def sync_broker_positions_to_db(cfg: Dict[str, Any]) -> int:
                 )
                 session.add(pos)
                 imported += 1
+            # Second pass: attempt to import debit spreads from pairs (same underlying/expiry/type)
+            # Build groupings
+            groups: Dict[tuple[str, str, str], list[dict]] = {}
+            for bp in broker_opts:
+                occ = bp.get('symbol') or bp.get('option_symbol') or (bp.get('option_contract') or {}).get('symbol')
+                if not occ or occ in existing_open:
+                    continue
+                typ = _occ_type(str(occ))
+                if typ not in ('CALL', 'PUT'):
+                    continue
+                under = str(bp.get('underlying_symbol') or '')
+                exp = parse_occ_expiry(str(occ) or '')
+                if not under or not exp:
+                    continue
+                key = (under, exp.isoformat(), typ)
+                groups.setdefault(key, []).append({
+                    'occ': str(occ),
+                    'qty': bp.get('qty') or bp.get('quantity') or bp.get('position_qty'),
+                    'side': str(bp.get('side') or bp.get('position_side') or '').lower(),
+                    'avg': bp.get('avg_entry_price') or bp.get('avg_price') or bp.get('average_price'),
+                })
+
+            for (under, exp_iso, typ), legs in groups.items():
+                # Need at least one long and one short of same type
+                longs = []
+                shorts = []
+                for L in legs:
+                    try:
+                        q = abs(int(float(L.get('qty') or 0)))
+                    except Exception:
+                        q = 0
+                    if q <= 0:
+                        continue
+                    k = parse_occ_strike(L['occ']) or 0.0
+                    if L.get('side') in ('short', 'sell'):
+                        shorts.append({'occ': L['occ'], 'qty': q, 'k': k, 'avg': L.get('avg')})
+                    else:
+                        longs.append({'occ': L['occ'], 'qty': q, 'k': k, 'avg': L.get('avg')})
+                if not longs or not shorts:
+                    continue
+                # Choose best candidate pair by closest strikes
+                best = None
+                for lo in longs:
+                    for sh in shorts:
+                        qty = min(lo['qty'], sh['qty'])
+                        if qty <= 0:
+                            continue
+                        # Determine structure validity
+                        if typ == 'CALL' and lo['k'] < sh['k']:
+                            structure = PositionStructure.BULL_CALL_SPREAD
+                        elif typ == 'PUT' and lo['k'] > sh['k']:
+                            structure = PositionStructure.BEAR_PUT_SPREAD
+                        else:
+                            continue
+                        diff = abs(lo['k'] - sh['k'])
+                        if best is None or diff < best['diff']:
+                            best = {'lo': lo, 'sh': sh, 'qty': qty, 'structure': structure, 'diff': diff}
+                if not best:
+                    continue
+                lo = best['lo']; sh = best['sh']; qty = best['qty']; structure = best['structure']
+                legs_json = [
+                    {'symbol': lo['occ'], 'side': 'buy', 'qty': qty},
+                    {'symbol': sh['occ'], 'side': 'sell', 'qty': qty},
+                ]
+                # Approx entry debit if both averages present
+                entry_debit = None
+                try:
+                    avg_lo = float(lo['avg']) if lo.get('avg') is not None else None
+                    avg_sh = float(sh['avg']) if sh.get('avg') is not None else None
+                    if avg_lo is not None and avg_sh is not None:
+                        entry_debit = max(0.0, (avg_lo - avg_sh) * 100.0 * qty)
+                except Exception:
+                    entry_debit = None
+                pos = Position(
+                    ticker=under,
+                    structure=structure,
+                    legs_json=legs_json,
+                    opened_at=now_et(),
+                    status=PositionStatus.OPEN,
+                    entry_debit=entry_debit,
+                    notes=f"imported=true; source=broker; expiry={exp_iso}",
+                )
+                session.add(pos)
+                imported += 1
             break
     except Exception as e:
         logger.error({"event": "sync_broker_positions_error", "err": str(e)})
@@ -157,17 +271,8 @@ def post_intraday_synopsis(cfg: Dict[str, Any]) -> None:
     disc = cfg.get("discord", {})
     webhook = disc.get("trades_webhook")
     if not webhook:
+        logger.info({"event": "intraday_synopsis_skip", "reason": "no_webhook"})
         return
-
-    # Universe
-    uni_cfg = cfg.get("universe", {})
-    top_n = int(uni_cfg.get("top_n", 15))
-    exclude = uni_cfg.get("exclude", [])
-    symbols = md.most_actives(top_n=top_n, exclude=exclude)
-    if not symbols:
-        static = uni_cfg.get("static", [])
-        if static:
-            symbols = [s for s in static if s not in exclude][:top_n]
 
     # Config
     sig_cfg = cfg.get("signals", {})
@@ -230,7 +335,65 @@ def post_intraday_synopsis(cfg: Dict[str, Any]) -> None:
     open_risk_cap_abs = (open_risk_cap_pct / 100.0) * max(equity, 0.0)
     slots_left = max(0, max_positions - current_positions)
 
-    import pandas as pd
+    # Header: account snapshot + open risk/slots
+    try:
+        a = acct.account()
+        cash = float(a.get("cash") or 0.0)
+        equity = float(a.get("equity") or 0.0)
+        buying_power = float(a.get("buying_power") or 0.0)
+    except Exception:
+        cash = equity = buying_power = 0.0
+    # Open DB positions count and open risk
+    try:
+        for session in get_session():
+            db_open = session.query(Position).filter(Position.status == PositionStatus.OPEN).all()
+            break
+    except Exception:
+        db_open = []
+    slots_left = max(0, int(cfg.get("risk", {}).get("max_concurrent_positions", 4)) - len(db_open))
+    try:
+        from sqlalchemy import func as _func
+        with next(get_session()) as s:
+            open_risk_sum = float(s.query(_func.coalesce(_func.sum(Position.entry_debit), 0.0)).filter(Position.status == PositionStatus.OPEN).scalar() or 0.0)
+    except Exception:
+        open_risk_sum = 0.0
+    open_risk_cap_abs = (float(cfg.get("risk", {}).get("max_open_risk_pct_of_equity", 40)) / 100.0) * max(equity, 0.0)
+
+    header = f"Open={len(db_open)} | Slots={slots_left} | Cash={_format_money(cash)} | BP={_format_money(buying_power)} | OpenRisk={_format_money(open_risk_sum)} / Cap={_format_money(open_risk_cap_abs)}"
+
+    # Open orders (broker)
+    try:
+        open_orders = orders.list_open_orders(status="open", asset_class="option", limit=50)
+    except Exception:
+        open_orders = []
+    ord_lines: list[str] = []
+    for o in open_orders[:15]:
+        sym = o.get("symbol") or o.get("legs", [{}])[0].get("symbol") if isinstance(o.get("legs"), list) else None
+        ord_lines.append(f"{sym or o.get('id')} | {o.get('side','').upper()} {o.get('type','').upper()} @ {o.get('limit_price')}")
+    if not ord_lines:
+        ord_lines = ["(none)"]
+
+    # Current positions (DB preview)
+    pos_lines: list[str] = []
+    for p in db_open[:15]:
+        pos_lines.append(f"{p.ticker} | {p.structure.name} | cost ${float(p.entry_debit or 0.0):.2f}")
+
+    payload = {
+        "embeds": [
+            {
+                "title": "Intraday Synopsis",
+                "description": header,
+                "color": int(disc.get("color_neutral", 15844367)),
+                "fields": [
+                    {"name": "Open Orders", "value": "\n".join(ord_lines), "inline": False},
+                    {"name": "Open Positions", "value": "\n".join(pos_lines) or "(none)", "inline": False},
+                ],
+            }
+        ]
+    }
+    ts_key = int(now_et().timestamp() // 300)
+    _send_once(webhook, f"INTRADAY_SYNOPSIS:{today_et()}:{ts_key}", payload)
+    return
     lines: list[str] = []
     entered = 0
     eligible = 0
@@ -689,6 +852,38 @@ def run_self_test(cfg: Dict[str, Any]) -> None:
                 })
     except Exception as e:
         logger.error({"event": "market_summary_error", "err": str(e)})
+
+    # Current positions preview and PnL
+    try:
+        # Load DB open positions
+        for session in get_session():
+            open_positions = session.query(Position).filter(Position.status == PositionStatus.OPEN).all()
+            break
+        occs: List[str] = []
+        for p in open_positions:
+            for leg in (p.legs_json or []):
+                if isinstance(leg, dict) and leg.get("symbol"):
+                    occs.append(leg["symbol"])
+        snaps = oc.snapshots(occs) if occs else {}
+        unreal = 0.0; open_risk = 0.0; lines: List[str] = []
+        for p in open_positions:
+            legs = p.legs_json or []
+            curr = legs_current_value(legs, snaps)
+            entry = float(p.entry_debit or 0.0)
+            open_risk += entry
+            unreal += (curr - entry)
+            lines.append(f"{p.ticker} | {p.structure.name} | cost ${entry:.2f} | mark ${curr:.2f} | UPL ${curr - entry:.2f}")
+        if webhook:
+            preview = "\n".join(lines[:10]) if lines else "(none)"
+            _send_once(webhook, f"SELFTEST_POS:{today_et()}", {
+                "embeds": [{
+                    "title": "Current Positions (preview)",
+                    "description": f"Open={len(open_positions)} | Open Risk={_format_money(open_risk)} | UPL={_format_money(unreal)}\n```\n{preview}\n```",
+                    "color": color_neutral,
+                }]
+            })
+    except Exception as e:
+        logger.error({"event": "selftest_positions_error", "err": str(e)})
 
     # Deep readiness check → Ready/Not Ready embed
     ready_fields: List[dict] = []
@@ -1184,6 +1379,12 @@ def run_intraday(cfg: Dict[str, Any]) -> None:
     webhook = disc.get("trades_webhook")
     color_neutral = int(disc.get("color_neutral", 15844367))
 
+    # Reconcile open entry orders: cancel on TTL, signal flip, or near close
+    try:
+        _reconcile_open_orders(cfg, md, oc, orders, webhook, disc)
+    except Exception as e:
+        logger.error({"event": "reconcile_orders_error", "err": str(e)})
+
     exits_cfg = cfg.get("exits", {})
     single_tp_lo = float(exits_cfg.get("single_profit_target_lo", 0.5))
     single_tp_hi = float(exits_cfg.get("single_profit_target_hi", 1.0))
@@ -1269,6 +1470,33 @@ def run_intraday(cfg: Dict[str, Any]) -> None:
                     logger.error({"event": "signal_flip_error", "ticker": p.ticker, "err": str(e)})
 
             if not exit_reason:
+                # Near-target/stop alerts (once per day per position)
+                try:
+                    near_lo = 0.9 * single_tp_lo
+                    near_stop = -0.4  # 40% drawdown alert before hard stop 50%
+                    today_key = str(today_et())
+                    if side == "buy" and roi >= near_lo and roi < single_tp_lo and webhook:
+                        _send_once(webhook, f"NEAR_TP:{p.id}:{today_key}", build_info_embed(
+                            title=f"[NEAR TP] {p.ticker} {p.structure.name}",
+                            description=f"ROI {roi*100:.1f}% (TP {int(single_tp_lo*100)}%)",
+                            color=int(disc.get("color_bullish", 3066993)),
+                            fields=[
+                                {"name": "Entry", "value": f"${entry:,.2f}", "inline": True},
+                                {"name": "Mark", "value": f"${current_val:,.2f}", "inline": True},
+                            ],
+                        ))
+                    if side == "buy" and roi <= near_stop and roi > -abs(single_hard_stop) and webhook:
+                        _send_once(webhook, f"NEAR_HS:{p.id}:{today_key}", build_info_embed(
+                            title=f"[NEAR STOP] {p.ticker} {p.structure.name}",
+                            description=f"ROI {roi*100:.1f}% (HS {int(single_hard_stop*100)}%)",
+                            color=int(disc.get("color_bearish", 15158332)),
+                            fields=[
+                                {"name": "Entry", "value": f"${entry:,.2f}", "inline": True},
+                                {"name": "Mark", "value": f"${current_val:,.2f}", "inline": True},
+                            ],
+                        ))
+                except Exception:
+                    pass
                 continue
 
             # Submit close order for singles
@@ -1279,16 +1507,6 @@ def run_intraday(cfg: Dict[str, Any]) -> None:
             except Exception as e:
                 logger.error({"event": "exit_order_error", "symbol": occ, "err": str(e)})
                 continue
-
-            # Mark position closed
-            try:
-                for session in get_session():
-                    dbp = session.get(Position, p.id)
-                    if dbp:
-                        dbp.status = PositionStatus.CLOSED
-                    break
-            except Exception as e:
-                logger.error({"event": "db_close_error", "pos_id": p.id, "err": str(e)})
 
             # Discord EXIT
             if webhook:
@@ -1319,17 +1537,18 @@ def run_intraday(cfg: Dict[str, Any]) -> None:
                 fill_price = (od or {}).get("filled_avg_price") or round(mid, 2)
                 realized = current_val - entry
                 ror = (current_val - entry) / entry if entry > 0 else 0.0
-                # persist closed_value/closed_at
-                try:
-                    for session in get_session():
-                        dbp = session.get(Position, p.id)
-                        if dbp:
-                            from datetime import datetime as _dt
-                            dbp.closed_value = current_val
-                            dbp.closed_at = now_et()
-                        break
-                except Exception:
-                    pass
+                # persist closed if filled
+                if od:
+                    try:
+                        for session in get_session():
+                            dbp = session.get(Position, p.id)
+                            if dbp:
+                                dbp.status = PositionStatus.CLOSED
+                                dbp.closed_value = current_val
+                                dbp.closed_at = now_et()
+                            break
+                    except Exception:
+                        pass
                 if webhook:
                     _send_once(webhook, f"CLOSED:{p.id}:{occ}", build_closed_embed(
                         title=f"[CLOSED] {p.ticker} {p.structure.name}",
@@ -1411,6 +1630,25 @@ def run_intraday(cfg: Dict[str, Any]) -> None:
                     logger.error({"event": "spread_signal_flip_error", "ticker": p.ticker, "err": str(e)})
 
             if not exit_reason:
+                # Near alerts for spreads
+                try:
+                    near_pt = 0.9 * pt_pct
+                    near_hs_val = entry * (1.0 - 0.4)
+                    today_key = str(today_et())
+                    if pct_to_max >= near_pt and pct_to_max < pt_pct and webhook:
+                        _send_once(webhook, f"NEAR_PT_SPREAD:{p.id}:{today_key}", build_info_embed(
+                            title=f"[NEAR PT] {p.ticker} {p.structure.name}",
+                            description=f"% of Max {pct_to_max*100:.1f}% (PT {int(pt_pct*100)}%)",
+                            color=color_neutral,
+                        ))
+                    if entry > 0 and curr_val <= near_hs_val and curr_val > entry * (1.0 - float(cfg.get("exits", {}).get("single_hard_stop_pct", 0.5))) and webhook:
+                        _send_once(webhook, f"NEAR_HS_SPREAD:{p.id}:{today_key}", build_info_embed(
+                            title=f"[NEAR STOP] {p.ticker} {p.structure.name}",
+                            description=f"{curr_val/entry*100:.1f}% of entry (HS 50%)",
+                            color=color_neutral,
+                        ))
+                except Exception:
+                    pass
                 continue
 
             # Build close legs: reverse intents
@@ -1432,15 +1670,7 @@ def run_intraday(cfg: Dict[str, Any]) -> None:
                 logger.error({"event": "spread_exit_order_error", "symbol": p.ticker, "err": str(e)})
                 continue
 
-            # Mark closed
-            try:
-                for session in get_session():
-                    dbp = session.get(Position, p.id)
-                    if dbp:
-                        dbp.status = PositionStatus.CLOSED
-                    break
-            except Exception as e:
-                logger.error({"event": "db_close_error", "pos_id": p.id, "err": str(e)})
+            # Mark closed only upon fill (see below)
 
             # Discord EXIT
             if webhook:
@@ -1465,15 +1695,17 @@ def run_intraday(cfg: Dict[str, Any]) -> None:
                         pass
                 realized = curr_val - entry
                 ror = (curr_val - entry) / entry if entry > 0 else 0.0
-                try:
-                    for session in get_session():
-                        dbp = session.get(Position, p.id)
-                        if dbp:
-                            dbp.closed_value = curr_val
-                            dbp.closed_at = now_et()
-                        break
-                except Exception:
-                    pass
+                if od:
+                    try:
+                        for session in get_session():
+                            dbp = session.get(Position, p.id)
+                            if dbp:
+                                dbp.status = PositionStatus.CLOSED
+                                dbp.closed_value = curr_val
+                                dbp.closed_at = now_et()
+                            break
+                    except Exception:
+                        pass
                 if webhook:
                     _send_once(webhook, f"CLOSED:{p.id}", build_closed_embed(
                         title=f"[CLOSED] {p.ticker} {p.structure.name}",
@@ -1919,10 +2151,47 @@ def run_eod(cfg: Dict[str, Any]) -> None:
                 snap = snaps.get(occ, {})
                 g = snap.get("greeks", {})
                 sgn = 1 if side == 'buy' else -1
-                if g:
-                    net_d += sgn * float(g.get("delta") or 0.0) * qty
-                    net_t += sgn * float(g.get("theta") or 0.0) * qty
-                    net_v += sgn * float(g.get("vega") or 0.0) * qty
+                d = float(g.get("delta") or 0.0)
+                t = float(g.get("theta") or 0.0)
+                v = float(g.get("vega") or 0.0)
+                # Optional fallback via Black-Scholes if greeks missing
+                try:
+                    use_fallback = bool(cfg.get("greeks", {}).get("fallback_black_scholes", True))
+                except Exception:
+                    use_fallback = True
+                if use_fallback and (d == 0.0 and t == 0.0 and v == 0.0):
+                    try:
+                        from src.pnl.valuers import parse_occ_strike, parse_occ_expiry, bsm_greeks, implied_vol_bsm
+                        strike = parse_occ_strike(occ or "") or 0.0
+                        exp = parse_occ_expiry(occ or "")
+                        if strike > 0 and exp:
+                            S = md.latest_trade_price(p.ticker)
+                            if S and S > 0:
+                                days = max(1, (exp - today).days)
+                                iv = float(g.get("iv") or 0.0)
+                                # if iv missing, infer from option mid price
+                                if iv <= 0:
+                                    q = snap.get("latest_quote", {}) if isinstance(snap, dict) else {}
+                                    bid = q.get("bid_price"); ask = q.get("ask_price")
+                                    mid_opt = ((bid or 0) + (ask or 0)) / 2.0 if bid and ask else None
+                                    if mid_opt and mid_opt > 0:
+                                        typ = _occ_type(occ or "C")
+                                        is_call = (typ == 'CALL')
+                                        iv_est = implied_vol_bsm(S, strike, days / 365.0, mid_opt, r=float(cfg.get("greeks", {}).get("risk_free_rate", 0.01)), is_call=is_call)
+                                        if iv_est:
+                                            iv = iv_est
+                                if iv and iv > 0:
+                                    typ = _occ_type(occ or "C")
+                                    is_call = (typ == 'CALL')
+                                    out = bsm_greeks(S, strike, days / 365.0, iv, r=float(cfg.get("greeks", {}).get("risk_free_rate", 0.01)), is_call=is_call)
+                                    d = out.get("delta", 0.0)
+                                    t = out.get("theta", 0.0)
+                                    v = out.get("vega", 0.0)
+                    except Exception:
+                        pass
+                net_d += sgn * d * qty
+                net_t += sgn * t * qty
+                net_v += sgn * v * qty
             greeks["delta"] += net_d
             greeks["theta"] += net_t
             greeks["vega"] += net_v
@@ -2028,24 +2297,38 @@ def run_eod(cfg: Dict[str, Any]) -> None:
                     open_risk2 += max(0.0, entry)
                     unreal2 += (sgn * (curr - entry))
                     g = snap.get("greeks", {}) if isinstance(snap, dict) else {}
-                    greeks2["delta"] += sgn * float(g.get("delta") or 0.0) * qty_abs
-                    greeks2["theta"] += sgn * float(g.get("theta") or 0.0) * qty_abs
-                    greeks2["vega"] += sgn * float(g.get("vega") or 0.0) * qty_abs
-                total_pl2 = unreal2  # realized unknown from broker snapshot
-                fields2 = [
-                    {"name": "Cash", "value": f"${cash:,.2f}", "inline": True},
-                    {"name": "Equity", "value": f"${equity:,.2f}", "inline": True},
-                    {"name": "Unrealized (broker)", "value": f"${unreal2:,.2f}", "inline": True},
-                    {"name": "Open Risk (broker)", "value": f"${open_risk2:,.2f}", "inline": True},
-                    {"name": "Greeks (broker)", "value": f"Delta {greeks2['delta']:.2f} | Theta {greeks2['theta']:.2f} | Vega {greeks2['vega']:.2f}", "inline": False},
-                ]
-                _send_once(eod, f"EOD_BROKER:{today}", {
-                    "embeds": [{
-                        "title": "EOD Summary (Broker Fallback)",
-                        "description": "Broker options positions snapshot (no DB positions found)",
-                        "fields": fields2,
-                    }]
-                })
+                    d = float(g.get("delta") or 0.0)
+                    t = float(g.get("theta") or 0.0)
+                    v = float(g.get("vega") or 0.0)
+                    # Fallback greeks if missing
+                    try:
+                        use_fallback = bool(cfg.get("greeks", {}).get("fallback_black_scholes", True))
+                    except Exception:
+                        use_fallback = True
+                    if use_fallback and (d == 0.0 and t == 0.0 and v == 0.0):
+                        try:
+                            from src.pnl.valuers import parse_occ_strike, parse_occ_expiry, bsm_greeks
+                            strike = parse_occ_strike(occ or "") or 0.0
+                            exp = parse_occ_expiry(occ or "")
+                            if strike > 0 and exp:
+                                S = md.latest_trade_price(str(bp.get('underlying_symbol') or ''))
+                                if S and S > 0:
+                                    from src.utils.time import today_et as _today
+                                    days = max(1, (exp - _today()).days)
+                                    iv = float(g.get("iv") or 0.0)
+                                    if iv and iv > 0:
+                                        typ = _occ_type(occ or "C")
+                                        is_call = (typ == 'CALL')
+                                        out = bsm_greeks(S, strike, days / 365.0, iv, r=float(cfg.get("greeks", {}).get("risk_free_rate", 0.01)), is_call=is_call)
+                                        d = out.get("delta", 0.0)
+                                        t = out.get("theta", 0.0)
+                                        v = out.get("vega", 0.0)
+                        except Exception:
+                            pass
+                    greeks2["delta"] += sgn * d * qty_abs
+                    greeks2["theta"] += sgn * t * qty_abs
+                    greeks2["vega"] += sgn * v * qty_abs
+                # Broker fallback disabled per user request; no EOD post if DB has no opens
             except Exception as _e:
                 logger.error({"event": "eod_broker_fallback_error", "err": str(_e)})
 
@@ -2185,6 +2468,7 @@ def run_daemon(cfg: Dict[str, Any]) -> None:
                 # Periodic intraday synopsis (non-blocking if it fails)
                 if last_synopsis_ts is None or (ts - last_synopsis_ts) >= synopsis_every:
                     try:
+                        logger.info({"event": "intraday_synopsis_due", "every_sec": synopsis_every})
                         post_intraday_synopsis(cfg)
                     except Exception as e:
                         logger.error({"event": "intraday_synopsis_error", "err": str(e)})
@@ -2210,3 +2494,131 @@ def run_daemon(cfg: Dict[str, Any]) -> None:
             run_eod(cfg)
         except Exception as e:
             logger.error({"event": "daemon_stop_eod_error", "err": str(e)})
+def _reconcile_open_orders(cfg: Dict[str, Any], md: MarketDataClient, oc: OptionsClient, orders: OrdersClient, webhook: str | None, disc: dict) -> None:
+    """Cancel working entry orders when strategy invalidates, TTL expires, or near close.
+
+    - Only considers options orders (asset_class=option).
+    - Signal flip: BULL calls vs BEAR puts using SMA20/50.
+    - TTL: cancel after entries.ttl_minutes.
+    - Near close: cancel within orders.cancel_before_close_minutes of EOD.
+    """
+    try:
+        open_orders = orders.list_open_orders(status="open", asset_class="option", limit=100)
+    except Exception:
+        open_orders = []
+    if not open_orders:
+        return
+
+    ord_cfg = cfg.get("orders", {})
+    ttl_min = int(ord_cfg.get("entries_ttl_minutes", 15))
+    cancel_before_close_min = int(ord_cfg.get("cancel_before_close_minutes", 15))
+    cancel_on_flip = bool(ord_cfg.get("cancel_on_signal_flip", True))
+    spread_buf = float(ord_cfg.get("spread_widen_buffer_pct", 0.05))
+    cancel_on_budget = bool(ord_cfg.get("cancel_on_budget_violation", True))
+
+    # Liquidity and budget thresholds
+    liq = cfg.get("liquidity", {})
+    max_spread_pct = float(liq.get("max_spread_pct", 0.10))
+    risk_cfg = cfg.get("risk", {})
+    per_min = float(risk_cfg.get("per_trade_dollar_min", 50))
+    per_max = float(risk_cfg.get("per_trade_dollar_max", 200))
+
+    # Compute today's EOD time
+    sched = cfg.get("scheduling", {})
+    eod_mh = _parse_cron_min_hour(sched.get("eod_cron", "15 16 * * 1-5")) or (15, 16)
+    eod_time = dtime(hour=eod_mh[1], minute=eod_mh[0])
+    now = now_et()
+    near_close = (now.hour * 60 + now.minute) >= (eod_time.hour * 60 + eod_time.minute - cancel_before_close_min)
+
+    from src.pnl.valuers import parse_occ_underlying
+    for o in open_orders:
+        try:
+            oid = o.get("id")
+            legs = o.get("legs") if isinstance(o.get("legs"), list) else []
+            occ = o.get("symbol") or (legs[0].get("symbol") if legs and isinstance(legs[0], dict) else None)
+            if not oid or not occ:
+                continue
+            # TTL check
+            created = o.get("submitted_at") or o.get("created_at") or o.get("created_at_ts")
+            too_old = False
+            try:
+                if isinstance(created, str) and len(created) >= 16:
+                    # ISO timestamp
+                    from datetime import datetime as _dt
+                    try:
+                        ts = _dt.fromisoformat(created.replace("Z", "+00:00"))
+                    except Exception:
+                        ts = None
+                    if ts:
+                        age_min = (now - ts).total_seconds() / 60.0
+                        too_old = age_min >= ttl_min
+            except Exception:
+                pass
+
+            reason = None
+            if near_close:
+                reason = "near_close"
+            elif too_old:
+                reason = "ttl_expired"
+            elif cancel_on_flip:
+                # Determine order direction: CALL legs => BULL, PUT legs => BEAR
+                has_call = (('C' in occ and occ.rfind('C') > occ.rfind('P')) or any('C' in str(l.get('symbol','')) for l in legs))
+                has_put = (('P' in occ and occ.rfind('P') > occ.rfind('C')) or any('P' in str(l.get('symbol','')) for l in legs))
+                order_dir = "BULL" if has_call and not has_put else ("BEAR" if has_put and not has_call else None)
+                under = parse_occ_underlying(occ) or ""
+                if order_dir and under:
+                    # Quick SMA using last 60 daily bars
+                    try:
+                        bars = md.daily_bars(under, lookback=60)
+                        closes = [b.get("close") for b in bars if b.get("close") is not None]
+                        if len(closes) >= 50:
+                            import pandas as pd
+                            df = compute_sma20_50(pd.DataFrame({"close": closes}))
+                            s20 = float(df["sma20"].iloc[-1]) if pd.notnull(df["sma20"].iloc[-1]) else None
+                            s50 = float(df["sma50"].iloc[-1]) if pd.notnull(df["sma50"].iloc[-1]) else None
+                            if s20 is not None and s50 is not None:
+                                dir_now = "BULL" if s20 > s50 else ("BEAR" if s20 < s50 else "NEUTRAL")
+                                if dir_now != order_dir and dir_now != "NEUTRAL":
+                                    reason = f"signal_flip {order_dir}->{dir_now}"
+                    except Exception:
+                        pass
+
+            # Spread widening or budget violation checks
+            if not reason:
+                try:
+                    snaps = oc.snapshots([occ])
+                    s = snaps.get(occ, {}) if isinstance(snaps, dict) else {}
+                    q = s.get("latest_quote", {})
+                    bid = q.get("bid_price"); ask = q.get("ask_price")
+                    if bid and ask and bid > 0 and ask > 0:
+                        mid = (bid + ask) / 2.0
+                        if mid > 0 and (abs(ask - bid) / mid) > (max_spread_pct + spread_buf):
+                            reason = "spread_widen"
+                except Exception:
+                    pass
+            if not reason and cancel_on_budget:
+                try:
+                    lp = o.get("limit_price")
+                    qty_o = o.get("qty") or o.get("quantity") or "1"
+                    qty = int(float(qty_o)) if qty_o is not None else 1
+                    if lp is not None:
+                        est_cost = float(lp) * 100.0 * max(1, qty)
+                        if est_cost < per_min or est_cost > per_max:
+                            reason = "budget_out_of_range"
+                except Exception:
+                    pass
+
+            if reason:
+                try:
+                    orders.cancel_order(oid)
+                    if webhook:
+                        _send_once(webhook, f"CANCELLED:{oid}", build_info_embed(
+                            title="[CANCELLED] Entry Order",
+                            description=f"Reason: {reason}",
+                            color=int(disc.get("color_neutral", 15844367)),
+                            fields=[{"name": "Order ID", "value": oid, "inline": True}, {"name": "OCC", "value": occ, "inline": True}],
+                        ))
+                except Exception:
+                    pass
+        except Exception:
+            continue

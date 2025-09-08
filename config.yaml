@@ -9,7 +9,7 @@ alpaca:
   contracts_source: "auto"          # auto | trading | data
 
 universe:
-  top_n: 25        # pull 10–20 candidates daily
+  top_n: 40        # pull 10–20 candidates daily
   exclude: ["BIOTECH_X", "PENNY_Y"]  # optional blacklist
   static: []       # optional static fallback universe when data API unavailable
 
@@ -61,6 +61,13 @@ scheduling:
   premarket_cron: "0 8 * * 1-5"      # 8:00 ET
   intraday_every_seconds: 60        # poll 2 min
   intraday_entries_enabled: true     # allow entries during market hours
-  intraday_entry_window: "09:40-15:30"  # ET window for intraday entries
-  intraday_synopsis_every_minutes: 60  # post intraday synopsis every N minutes
+  intraday_entry_window: "09:40-16:00"  # ET window for intraday entries
+  intraday_synopsis_every_minutes: 1  # post intraday synopsis every N minutes
   eod_cron: "15 16 * * 1-5"          # 4:15 ET
+
+orders:
+  entries_ttl_minutes: 15            # cancel working entries older than N minutes
+  cancel_on_signal_flip: true        # cancel entries if SMA20/50 flips against them
+  cancel_before_close_minutes: 15    # cancel working entries N minutes before EOD
+  spread_widen_buffer_pct: 0.05      # extra tolerance above max_spread_pct before cancel
+  cancel_on_budget_violation: true   # cancel if limit * 100 * qty outside per_trade_min/max

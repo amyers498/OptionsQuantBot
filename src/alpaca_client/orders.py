@@ -101,3 +101,18 @@ class OrdersClient:
                 pass
             _t.sleep(poll_interval)
         return None
+
+    def list_open_orders(self, *, status: str = "open", asset_class: str | None = None, limit: int = 100) -> list[dict]:
+        """List broker orders. Default lists open orders. Fetches up to `limit`.
+
+        Note: Alpaca paginates; for simplicity this fetches only first page.
+        """
+        params: Dict[str, Any] = {"status": status, "limit": limit}
+        if asset_class:
+            params["asset_class"] = asset_class
+        url = f"{self.base_url}/v2/orders"
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(url, headers=self.headers, params=params)
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else []

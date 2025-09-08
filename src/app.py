@@ -4,7 +4,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from src.scheduler.runner import run_premarket, run_intraday, run_eod
+from src.scheduler.runner import run_premarket, run_intraday, run_eod, post_intraday_synopsis
 from src.utils.logging import get_logger
 from src.utils.time import set_local_tz
 from src.utils.config import load_config
@@ -36,6 +36,7 @@ def main() -> None:
     sub.add_parser("premarket", help="Run premarket workflow")
     sub.add_parser("intraday", help="Run intraday polling loop once")
     sub.add_parser("eod", help="Run end-of-day workflow")
+    sub.add_parser("synopsis", help="Post an intraday synopsis once (for testing)")
 
     args = parser.parse_args()
 
@@ -73,6 +74,9 @@ def main() -> None:
     elif cmd == "eod":
         logger.info("Starting end-of-day workflow")
         run_eod(cfg)
+    elif cmd == "synopsis":
+        logger.info("Posting intraday synopsis (one-off)")
+        post_intraday_synopsis(cfg)
     else:
         parser.print_help()
 
