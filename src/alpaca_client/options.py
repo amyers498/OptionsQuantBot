@@ -149,6 +149,27 @@ class OptionsClient:
         # Chunk requests if needed (limit URL length)
         out: Dict[str, Dict[str, Any]] = {}
         step = 100
+        def _norm_snap(s: Dict[str, Any]) -> Dict[str, Any]:
+            # Normalize various quote field shapes/keys
+            q = (
+                s.get("latest_quote")
+                or s.get("quote")
+                or s.get("last_quote")
+                or s.get("latestQuote")
+                or {}
+            )
+            if "bid_price" not in q:
+                if "bp" in q:
+                    q["bid_price"] = q.get("bp")
+                elif "bid" in q:
+                    q["bid_price"] = q.get("bid")
+            if "ask_price" not in q:
+                if "ap" in q:
+                    q["ask_price"] = q.get("ap")
+                elif "ask" in q:
+                    q["ask_price"] = q.get("ask")
+            s["latest_quote"] = q
+            return s
         for i in range(0, len(symbols), step):
             chunk = symbols[i : i + step]
             data = self._get(
@@ -161,7 +182,7 @@ class OptionsClient:
                 for sym, snap in snaps.items():
                     if not sym or not isinstance(snap, dict):
                         continue
-                    out[sym] = snap
+                    out[sym] = _norm_snap(snap)
             else:
                 for s in snaps:
                     if not isinstance(s, dict):
@@ -169,5 +190,5 @@ class OptionsClient:
                     sym = s.get("symbol")
                     if not sym:
                         continue
-                    out[sym] = s
+                    out[sym] = _norm_snap(s)
         return out

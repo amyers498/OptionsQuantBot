@@ -26,3 +26,22 @@ class AccountClient:
                 return []
             r.raise_for_status()
             return r.json()
+
+    def options_positions(self) -> List[Dict[str, Any]]:
+        """Return open options positions if the endpoint is available.
+
+        Falls back to empty list on 404 or network errors.
+        """
+        url = f"{self.base_url}/v2/options/positions"
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                r = client.get(url, headers=self.headers)
+                if r.status_code == 404:
+                    return []
+                r.raise_for_status()
+                data = r.json()
+                if isinstance(data, dict) and data.get("positions"):
+                    return data.get("positions") or []
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []

@@ -3,9 +3,11 @@ from __future__ import annotations
 import time
 from datetime import datetime, time as dtime
 from typing import Any, Dict, List
+from pathlib import Path
 
 from src.utils.logging import get_logger
-from src.utils.time import now_et, today_et
+from src.utils.time import now_et, today_et, set_local_tz
+from src.utils.config import load_config
 from src.data.db import init_db, get_session
 from src.data.repositories import OutboxRepo
 from src.alpaca_client.auth import get_api_keys
@@ -51,6 +53,406 @@ def _build_clients(cfg: Dict[str, Any]):
     return headers, md, oc, orders, acct
 
 
+def _format_money(v: float | None) -> str:
+    try:
+        return f"${float(v or 0.0):,.2f}"
+    except Exception:
+        return "$0.00"
+
+
+def _occ_type(occ: str) -> str | None:
+    try:
+        # OCC format ...C... or ...P...
+        if 'C' in occ and (occ.rfind('C') > occ.rfind('P')):
+            return 'CALL'
+        if 'P' in occ and (occ.rfind('P') > occ.rfind('C')):
+            return 'PUT'
+    except Exception:
+        return None
+    return None
+
+
+def sync_broker_positions_to_db(cfg: Dict[str, Any]) -> int:
+    """Import existing broker options positions into DB so exit engine can manage them.
+
+    - Only imports long CALL/PUT single legs (debit positions) to match current exit logic.
+    - Skips symbols already present as OPEN positions in DB.
+    - Returns number of positions imported.
+    """
+    _, _, _, _, acct = _build_clients(cfg)
+    try:
+        broker_opts = acct.options_positions()
+    except Exception:
+        broker_opts = []
+    if not broker_opts:
+        return 0
+
+    imported = 0
+    try:
+        for session in get_session():
+            # Build set of existing OPEN OCC symbols in DB
+            existing_open: set[str] = set()
+            try:
+                db_positions = session.query(Position).filter(Position.status == PositionStatus.OPEN).all()
+                for p in db_positions:
+                    for leg in (p.legs_json or []):
+                        if isinstance(leg, dict) and leg.get('symbol'):
+                            existing_open.add(str(leg['symbol']))
+            except Exception:
+                pass
+
+            for bp in broker_opts:
+                occ = (
+                    bp.get('symbol')
+                    or bp.get('option_symbol')
+                    or (bp.get('option_contract') or {}).get('symbol')
+                )
+                if not occ:
+                    continue
+                if occ in existing_open:
+                    continue
+                # Only import long positions
+                qty_raw = bp.get('qty') or bp.get('quantity') or bp.get('position_qty') or bp.get('qty_available')
+                try:
+                    qty = abs(int(float(qty_raw))) if qty_raw is not None else 0
+                except Exception:
+                    qty = 0
+                if qty <= 0:
+                    continue
+                side = str(bp.get('side') or bp.get('position_side') or '').lower()
+                if side in ('short', 'sell'):
+                    continue
+                typ = _occ_type(str(occ))
+                if typ not in ('CALL', 'PUT'):
+                    continue
+                # Entry debit (approx) from avg entry price if available
+                entry_price = bp.get('avg_entry_price') or bp.get('avg_price') or bp.get('average_price')
+                try:
+                    entry_debit = float(entry_price) * 100.0 * qty if entry_price is not None else None
+                except Exception:
+                    entry_debit = None
+
+                structure = PositionStructure.CALL if typ == 'CALL' else PositionStructure.PUT
+                pos = Position(
+                    ticker=str(bp.get('underlying_symbol') or bp.get('symbol', '')[:6]).strip(),
+                    structure=structure,
+                    legs_json=[{"symbol": str(occ), "side": "buy", "qty": qty}],
+                    opened_at=now_et(),
+                    status=PositionStatus.OPEN,
+                    entry_debit=entry_debit,
+                    notes="imported=true; source=broker",
+                )
+                session.add(pos)
+                imported += 1
+            break
+    except Exception as e:
+        logger.error({"event": "sync_broker_positions_error", "err": str(e)})
+        return imported
+    return imported
+
+
+def post_intraday_synopsis(cfg: Dict[str, Any]) -> None:
+    """Post a 5-minute synopsis during market hours explaining entry outcomes per symbol."""
+    headers, md, oc, orders, acct = _build_clients(cfg)
+    disc = cfg.get("discord", {})
+    webhook = disc.get("trades_webhook")
+    if not webhook:
+        return
+
+    # Universe
+    uni_cfg = cfg.get("universe", {})
+    top_n = int(uni_cfg.get("top_n", 15))
+    exclude = uni_cfg.get("exclude", [])
+    symbols = md.most_actives(top_n=top_n, exclude=exclude)
+    if not symbols:
+        static = uni_cfg.get("static", [])
+        if static:
+            symbols = [s for s in static if s not in exclude][:top_n]
+
+    # Config
+    sig_cfg = cfg.get("signals", {})
+    sma_long = int(sig_cfg.get("sma_long", 50))
+    lookback_bars = int(sig_cfg.get("bars_lookback", max(sma_long + 50, 150)))
+    lookback_iv_days = int(sig_cfg.get("iv_percentile_lookback_days", 90))
+    lo_thr = float(sig_cfg.get("iv_low_threshold_pctile", 30))
+    hi_thr = float(sig_cfg.get("iv_high_threshold_pctile", 70))
+
+    strat_cfg = cfg.get("strategy", {})
+    dmin = int(strat_cfg.get("expiry_min_days", 7))
+    dmax = int(strat_cfg.get("expiry_max_days", 21))
+    d_lo = float(strat_cfg.get("single_delta_min", 0.35))
+    d_hi = float(strat_cfg.get("single_delta_max", 0.55))
+    width_default = float(strat_cfg.get("spread_width_default", 5.0))
+    use_im_cap = bool(strat_cfg.get("use_implied_move_for_cap", True))
+
+    liq = cfg.get("liquidity", {})
+    min_oi = int(liq.get("min_open_interest", 500))
+    min_vol = int(liq.get("min_volume", 50))
+    max_spread_pct = float(liq.get("max_spread_pct", 0.10))
+
+    risk_cfg = cfg.get("risk", {})
+    per_min = float(risk_cfg.get("per_trade_dollar_min", 50))
+    per_max = float(risk_cfg.get("per_trade_dollar_max", 200))
+    min_premium = float(risk_cfg.get("min_premium", 0.4))
+    max_positions = int(risk_cfg.get("max_concurrent_positions", 4))
+    open_risk_cap_pct = float(risk_cfg.get("max_open_risk_pct_of_equity", 40))
+
+    # Account snapshot
+    def _to_float(v, default=0.0):
+        try:
+            return default if v is None else float(v)
+        except Exception:
+            return default
+    try:
+        a = acct.account()
+    except Exception:
+        a = {}
+    cash = _to_float(a.get("cash"), 0.0)
+    equity = _to_float(a.get("equity"), cash)
+    buying_power = _to_float(a.get("buying_power"), cash)
+    try:
+        broker_positions = acct.positions()
+    except Exception:
+        broker_positions = []
+    def _is_opt(p: dict) -> bool:
+        return (str(p.get("asset_class") or "").lower() == "option") or len(str(p.get("symbol") or "")) >= 15
+    current_positions = len([p for p in broker_positions if isinstance(p, dict) and _is_opt(p)])
+
+    # DB open risk sum
+    try:
+        for session in get_session():
+            from sqlalchemy import func as _func
+            open_risk_now = session.query(_func.coalesce(_func.sum(Position.entry_debit), 0.0)).filter(Position.status == PositionStatus.OPEN).scalar()
+            open_risk_sum = float(open_risk_now or 0.0)
+            break
+    except Exception:
+        open_risk_sum = 0.0
+    open_risk_cap_abs = (open_risk_cap_pct / 100.0) * max(equity, 0.0)
+    slots_left = max(0, max_positions - current_positions)
+
+    import pandas as pd
+    lines: list[str] = []
+    entered = 0
+    eligible = 0
+
+    # Build recent entered IDs to summarize (best-effort)
+    recent_ids: list[str] = []
+
+    for sym in symbols:
+        reason = None
+        try:
+            if slots_left <= 0:
+                reason = "no slots left"
+                lines.append(f"{sym} -> skipped ({reason})")
+                continue
+
+            # Trend
+            bars = md.daily_bars(sym, lookback=lookback_bars)
+            closes = [b.get("close") for b in bars if b.get("close") is not None]
+            if len(closes) < sma_long:
+                lines.append(f"{sym} -> skipped (insufficient history: {len(closes)} bars)")
+                continue
+            df = compute_sma20_50(pd.DataFrame({"close": closes}))
+            s20 = df["sma20"].iloc[-1]
+            s50 = df["sma50"].iloc[-1]
+            if pd.isna(s20) or pd.isna(s50):
+                lines.append(f"{sym} -> skipped (SMA not available)")
+                continue
+            direction = "BULL" if float(s20) > float(s50) else ("BEAR" if float(s20) < float(s50) else "NEUTRAL")
+            if direction == "NEUTRAL":
+                lines.append(f"{sym} -> skipped (NEUTRAL)")
+                continue
+
+            # Spot
+            spot = md.latest_trade_price(sym)
+            if spot is None:
+                lines.append(f"{sym} {direction} -> skipped (no spot)")
+                continue
+
+            # Contracts & expiry
+            cons = oc.contracts(sym, dmin, dmax)
+            if not cons:
+                cons = oc.contracts(sym, dmin, 28)
+            cons = [c for c in cons if c.get("expiration_date")]
+            if not cons:
+                lines.append(f"{sym} {direction} -> skipped (no contracts)")
+                continue
+            from datetime import datetime as _dt, date as _date
+            def _dte(exp: str) -> int:
+                try:
+                    d = _dt.fromisoformat(exp).date()
+                except Exception:
+                    d = _date.fromisoformat(exp)
+                return (d - _date.today()).days
+            cons.sort(key=lambda c: abs(_dte(c.get("expiration_date", ""))))
+            expiry = cons[0]["expiration_date"]
+            same_exp = [c for c in cons if c.get("expiration_date") == expiry]
+            same_exp.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - spot))
+            focus = same_exp[:30]
+            occ_syms = [c.get("symbol") for c in focus if c.get("symbol")]
+            snaps = oc.snapshots(occ_syms)
+
+            def _mid(occ: str) -> float | None:
+                s = snaps.get(occ, {})
+                q = s.get("latest_quote", {})
+                bp, ap = q.get("bid_price"), q.get("ask_price")
+                if not bp or not ap or bp <= 0 or ap <= 0:
+                    return None
+                return (bp + ap) / 2.0
+            def _iv(occ: str) -> float | None:
+                s = snaps.get(occ, {}); g = s.get("greeks", {}); v = g.get("iv"); return float(v) if v is not None else None
+
+            calls = [c for c in focus if c.get("type") == "call"]
+            puts = [c for c in focus if c.get("type") == "put"]
+            calls.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - spot))
+            puts.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - spot))
+            atm_call = calls[0] if calls else None
+            atm_put = puts[0] if puts else None
+            if not atm_call or not atm_put:
+                lines.append(f"{sym} {direction} -> skipped (no ATM options)")
+                continue
+
+            # IV regime
+            pct = None
+            iv_vals = [v for v in (_iv(atm_call["symbol"]), _iv(atm_put["symbol"])) if v is not None]
+            atm_iv = sum(iv_vals) / len(iv_vals) if iv_vals else None
+            try:
+                for session in get_session():
+                    _, pct = upsert_iv_summary(session, sym, today_et(), float(atm_call.get("strike_price")) if atm_call else None,
+                                               _dt.fromisoformat(expiry).date() if isinstance(expiry, str) else expiry,
+                                               atm_iv, lookback_iv_days)
+                    break
+            except Exception:
+                pct = None
+            iv_regime = "MID" if pct is None else ("LOW" if pct <= lo_thr else ("HIGH" if pct >= hi_thr else "MID"))
+            strat = choose_strategy(SignalSnapshot(direction=direction, iv_regime=iv_regime))
+            if strat is None:
+                lines.append(f"{sym} {direction}+{iv_regime} -> skipped (no strategy)")
+                continue
+
+            # Liquidity baseline
+            def _liq(occ: str, eff_cap: float | None = None) -> bool:
+                s = snaps.get(occ, {}); q = s.get("latest_quote", {})
+                oi = s.get("open_interest") or 0; vol = s.get("day", {}).get("volume") or 0
+                cap = max_spread_pct if eff_cap is None else eff_cap
+                return oi >= min_oi and vol >= min_vol and passes_liquidity(oi, vol, q.get("bid_price"), q.get("ask_price"), cap)
+            if not (_liq(atm_call["symbol"]) and _liq(atm_put["symbol"])):
+                lines.append(f"{sym} {direction}+{iv_regime} -> skipped (illiquid ATM)")
+                continue
+
+            # Singles candidate
+            if strat in ("CALL", "PUT"):
+                side_list = calls if strat == "CALL" else puts
+                from src.selector.strikes import Contract, pick_single_delta_band
+                cands: list[Contract] = []
+                for c in side_list:
+                    s = snaps.get(c["symbol"], {}); g = s.get("greeks", {}); q = s.get("latest_quote", {})
+                    cands.append(Contract(symbol=c["symbol"], expiry=expiry, strike=float(c.get("strike_price", 0.0)),
+                                          type=("C" if c.get("type") == "call" else "P"), delta=g.get("delta"),
+                                          bid=q.get("bid_price"), ask=q.get("ask_price"), mid=_mid(c["symbol"]) or 0.0))
+                pick = pick_single_delta_band(cands, d_lo, d_hi)
+                if not pick:
+                    lines.append(f"{sym} {direction}+{iv_regime} -> skipped (no contract in Δ[{d_lo:.2f},{d_hi:.2f}])")
+                    continue
+                s = snaps.get(pick.symbol, {}); q = s.get("latest_quote", {})
+                oi = s.get("open_interest") or 0; vol = s.get("day", {}).get("volume") or 0
+                eff_cap = 0.05 if (pick.mid or 0.0) < 0.80 else max_spread_pct
+                if not passes_liquidity(oi, vol, q.get("bid_price"), q.get("ask_price"), eff_cap):
+                    lines.append(f"{sym} {direction}+{iv_regime} -> skipped (illiquid Δ {float(pick.delta or 0):.2f})")
+                    continue
+                debit = float(pick.mid or 0.0)
+                if debit <= 0 or debit < min_premium:
+                    lines.append(f"{sym} {direction}+{iv_regime} -> skipped (debit ${debit:.2f} < min ${min_premium:.2f})")
+                    continue
+                qty = int(max(1, per_max // (debit * 100)))
+                if qty < 1 or (debit * 100) < per_min:
+                    lines.append(f"{sym} {direction}+{iv_regime} -> skipped (budget too small)")
+                    continue
+                est_cost = debit * 100.0 * qty
+                if (open_risk_sum + est_cost) > open_risk_cap_abs:
+                    lines.append(f"{sym} {direction}+{iv_regime} -> skipped (open-risk cap)")
+                    continue
+                eligible += 1
+                lines.append(f"{sym} {direction}+{iv_regime} -> {strat} exp={expiry} K={pick.strike:g} Δ={(pick.delta or 0):.2f} mid=${debit:.2f} qty={qty} est_cost={_format_money(est_cost)}")
+            else:
+                # Spread
+                atm_call_mid = _mid(atm_call["symbol"]) or 0.0
+                atm_put_mid = _mid(atm_put["symbol"]) or 0.0
+                if atm_call_mid <= 0 or atm_put_mid <= 0:
+                    lines.append(f"{sym} {direction}+{iv_regime} -> skipped (bad ATM quotes)")
+                    continue
+                from src.features.implied_move import implied_move_abs
+                im = implied_move_abs(atm_call_mid, atm_put_mid) or width_default
+                if direction == "BULL":
+                    long_leg = atm_call; target = spot + (im if use_im_cap else width_default); short_pool = calls
+                else:
+                    long_leg = atm_put; target = spot - (im if use_im_cap else width_default); short_pool = puts
+                short_pool.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - target))
+                short_leg = short_pool[0] if short_pool else None
+                def _liq_leg(c: dict) -> bool:
+                    s = snaps.get(c["symbol"], {})
+                    q = s.get("latest_quote", {})
+                    bid = q.get("bid_price"); ask = q.get("ask_price")
+                    if not bid or not ask or bid <= 0 or ask <= 0:
+                        return False
+                    mid = (bid + ask) / 2.0
+                    if mid <= 0:
+                        return False
+                    if abs(ask - bid) / mid > max_spread_pct:
+                        return False
+                    oi = s.get("open_interest"); vol = (s.get("day", {}) or {}).get("volume")
+                    if oi is not None and oi < min_oi:
+                        return False
+                    if vol is not None and vol < min_vol:
+                        return False
+                    return True
+                if not short_leg or not _liq_leg(short_leg):
+                    alt = spot + (width_default if direction == "BULL" else -width_default)
+                    short_pool.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - alt))
+                    if short_pool and _liq_leg(short_pool[0]):
+                        short_leg = short_pool[0]
+                if not short_leg:
+                    lines.append(f"{sym} {direction}+{iv_regime} -> skipped (no viable short leg)")
+                    continue
+                long_mid = _mid(long_leg["symbol"]) or 0.0
+                short_mid = _mid(short_leg["symbol"]) or 0.0
+                if long_mid <= 0 or short_mid <= 0:
+                    lines.append(f"{sym} {direction}+{iv_regime} -> skipped (bad quotes for legs)")
+                    continue
+                net_debit = max(0.0, long_mid - short_mid)
+                if net_debit < min_premium or not (per_min <= net_debit * 100 <= per_max):
+                    lines.append(f"{sym} {direction}+{iv_regime} -> skipped (debit ${net_debit:.2f} outside budget)")
+                    continue
+                est_cost = net_debit * 100.0
+                if (open_risk_sum + est_cost) > open_risk_cap_abs:
+                    lines.append(f"{sym} {direction}+{iv_regime} -> skipped (open-risk cap)")
+                    continue
+                eligible += 1
+                try:
+                    k_long = float(long_leg.get("strike_price")); k_short = float(short_leg.get("strike_price"))
+                    width = abs(k_short - k_long)
+                    lines.append(f"{sym} {direction}+{iv_regime} -> {strat} exp={expiry} Klong={k_long:g} Kshort={k_short:g} width=${width:.2f} debit=${net_debit:.2f} qty=1 est_cost={_format_money(est_cost)}")
+                except Exception:
+                    lines.append(f"{sym} {direction}+{iv_regime} -> {strat} exp={expiry} debit=${net_debit:.2f} qty=1 est_cost={_format_money(est_cost)}")
+        except Exception as e:
+            lines.append(f"{sym} -> error ({str(e)})")
+            continue
+
+    # Compose embed
+    slots_after = max(0, max_positions - current_positions)
+    desc = f"Open={current_positions} | Slots={slots_left} | Cash={_format_money(cash)} | BP={_format_money(buying_power)} | OpenRisk={_format_money(open_risk_sum)} / Cap={_format_money(open_risk_cap_abs)}"
+    joined = "\n".join(lines[:45])  # keep within embed limits
+    payload = build_info_embed(
+        title="Intraday Synopsis",
+        description=desc,
+        color=int(disc.get("color_neutral", 15844367)),
+        fields=[{"name": "Per-Symbol", "value": f"```\n{joined}\n```", "inline": False}],
+    )
+    # Use a key with minute bucket to dedupe
+    ts_key = int(now_et().timestamp() // 300)
+    _send_once(webhook, f"INTRADAY_SYNOPSIS:{today_et()}:{ts_key}", payload)
+
+
 def _send_once(webhook: str, key: str, payload: Dict[str, Any]) -> None:
     try:
         for session in get_session():
@@ -74,6 +476,11 @@ def _send_once(webhook: str, key: str, payload: Dict[str, Any]) -> None:
 
 
 def run_self_test(cfg: Dict[str, Any]) -> None:
+    # Ensure DB is initialized for optional percentile computations and outbox writes
+    try:
+        init_db()
+    except Exception:
+        pass
     alp = cfg.get("alpaca", {})
     headers, md, oc, _, acct = _build_clients(cfg)
     disc = cfg.get("discord", {})
@@ -121,6 +528,167 @@ def run_self_test(cfg: Dict[str, Any]) -> None:
             color=color_neutral,
             fields=fields,
         ))
+
+    # Market Summary (on start) using SMA20/50 direction per top universe
+    try:
+        import pandas as pd  # local import to avoid global dep at module import time
+        uni_cfg = cfg.get("universe", {})
+        top_n = int(uni_cfg.get("top_n", 15))
+        exclude = uni_cfg.get("exclude", [])
+        symbols = md.most_actives(top_n=top_n, exclude=exclude)
+        if not symbols:
+            static = uni_cfg.get("static", [])
+            if static:
+                symbols = [s for s in static if s not in exclude][:top_n]
+        bull_syms: List[str] = []
+        bear_syms: List[str] = []
+        neutral_syms: List[str] = []
+        bar_counts_ordered: List[tuple[str, int]] = []
+        # Use same expanded lookback as trading to avoid classifying everything as NEUTRAL due to insufficient history
+        sig_cfg = cfg.get("signals", {})
+        sma_long = int(sig_cfg.get("sma_long", 50))
+        lookback_bars = int(sig_cfg.get("bars_lookback", max(sma_long + 50, 150)))
+        # Additional config for plan generation
+        lookback_iv_days = int(sig_cfg.get("iv_percentile_lookback_days", 90))
+        lo_thr = float(sig_cfg.get("iv_low_threshold_pctile", 30))
+        hi_thr = float(sig_cfg.get("iv_high_threshold_pctile", 70))
+        strat_cfg = cfg.get("strategy", {})
+        dmin = int(strat_cfg.get("expiry_min_days", 7))
+        dmax = int(strat_cfg.get("expiry_max_days", 21))
+        plan_lines: List[str] = []
+        # Plan mode: lightweight (no options endpoints) or full (contracts+snapshots) — default lightweight to avoid blocking at startup
+        diag_cfg = cfg.get("diagnostics", {})
+        plan_mode = str(diag_cfg.get("startup_plan_mode", "lightweight")).lower()
+        for sym in symbols:
+            try:
+                bars = md.daily_bars(sym, lookback=lookback_bars)
+                bar_counts_ordered.append((sym, len(bars)))
+                closes = [b.get("close") for b in bars if b.get("close") is not None]
+                if len(closes) < 50:
+                    neutral_syms.append(sym)
+                    plan_lines.append(f"{sym} NEUTRAL -> (insufficient history)")
+                    continue
+                df = compute_sma20_50(pd.DataFrame({"close": closes}))
+                sma20 = float(df["sma20"].iloc[-1]) if pd.notnull(df["sma20"].iloc[-1]) else None
+                sma50 = float(df["sma50"].iloc[-1]) if pd.notnull(df["sma50"].iloc[-1]) else None
+                if sma20 is None or sma50 is None:
+                    neutral_syms.append(sym)
+                    plan_lines.append(f"{sym} NEUTRAL -> (SMA not available)")
+                    continue
+                direction = "BULL" if sma20 > sma50 else ("BEAR" if sma20 < sma50 else "NEUTRAL")
+                if direction == "NEUTRAL":
+                    neutral_syms.append(sym)
+                    plan_lines.append(f"{sym} NEUTRAL -> (no trade)")
+                    continue
+                (bull_syms if direction == "BULL" else bear_syms).append(sym)
+
+                if plan_mode == "full":
+                    # Compute IV regime and tentative expiry to pick strategy (may use options endpoints; can be slow)
+                    try:
+                        spot = md.latest_trade_price(sym)
+                        if spot is None:
+                            plan_lines.append(f"{sym} {direction}+MID -> (no spot)")
+                            continue
+                        cons = oc.contracts(sym, dmin, dmax)
+                        if not cons:
+                            cons = oc.contracts(sym, dmin, 28)
+                        cons = [c for c in cons if c.get("expiration_date")]
+                        if not cons:
+                            plan_lines.append(f"{sym} {direction}+MID -> (no contracts)")
+                            continue
+                        from datetime import datetime as _dt, date as _date
+                        def _dte(exp: str) -> int:
+                            try:
+                                d = _dt.fromisoformat(exp).date()
+                            except Exception:
+                                d = _date.fromisoformat(exp)
+                            return (d - _date.today()).days
+                        cons.sort(key=lambda c: abs(_dte(c["expiration_date"])) )
+                        expiry = cons[0]["expiration_date"]
+                        same_exp = [c for c in cons if c.get("expiration_date") == expiry]
+                        same_exp.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - spot))
+                        calls = [c for c in same_exp if c.get("type") == "call"]
+                        puts = [c for c in same_exp if c.get("type") == "put"]
+                        calls.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - spot))
+                        puts.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - spot))
+                        atm_call = calls[0] if calls else None
+                        atm_put = puts[0] if puts else None
+                        pct = None
+                        if atm_call and atm_put:
+                            occs = [atm_call.get("symbol"), atm_put.get("symbol")]
+                            snaps = oc.snapshots([o for o in occs if o]) if occs else {}
+                            def _iv(occ: str) -> float | None:
+                                s = snaps.get(occ, {}); g = s.get("greeks", {}); v = g.get("iv"); return float(v) if v is not None else None
+                            iv_vals = [v for v in (_iv(atm_call["symbol"]), _iv(atm_put["symbol"])) if v is not None]
+                            atm_iv = sum(iv_vals) / len(iv_vals) if iv_vals else None
+                            try:
+                                for session in get_session():
+                                    pct = upsert_iv_summary(session, sym, today_et(), float(atm_call.get("strike_price")) if atm_call else None,
+                                                            _dt.fromisoformat(expiry).date() if isinstance(expiry, str) else expiry,
+                                                            atm_iv, lookback_iv_days)[1]
+                                    break
+                            except Exception:
+                                pct = None
+                        iv_regime = "MID" if pct is None else ("LOW" if pct <= lo_thr else ("HIGH" if pct >= hi_thr else "MID"))
+                        strat = choose_strategy(SignalSnapshot(direction=direction, iv_regime=iv_regime))
+                        if strat is None:
+                            plan_lines.append(f"{sym} {direction}+{iv_regime} -> (no strategy)")
+                            continue
+                        try:
+                            plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} exp={expiry} spot=${spot:.2f}")
+                        except Exception:
+                            plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} exp={expiry}")
+                    except Exception:
+                        plan_lines.append(f"{sym} {direction}+MID -> (plan error)")
+                else:
+                    # Lightweight plan: avoid options endpoints; assume MID IV and no expiry fetch
+                    iv_regime = "MID"
+                    strat = choose_strategy(SignalSnapshot(direction=direction, iv_regime=iv_regime))
+                    try:
+                        spot = md.latest_trade_price(sym)
+                    except Exception:
+                        spot = None
+                    if strat is None:
+                        plan_lines.append(f"{sym} {direction}+{iv_regime} -> (no strategy)")
+                    else:
+                        if spot is not None:
+                            plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} spot=${spot:.2f}")
+                        else:
+                            plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat}")
+            except Exception:
+                neutral_syms.append(sym)
+                plan_lines.append(f"{sym} NEUTRAL -> (error)")
+        logger.info({
+            "event": "market_summary_start",
+            "bullish": len(bull_syms),
+            "bearish": len(bear_syms),
+            "neutral": len(neutral_syms),
+            "bar_counts": {s: n for s, n in bar_counts_ordered},
+        })
+        if webhook:
+            _send_once(webhook, f"MARKET_SUMMARY:{today_et()}", build_info_embed(
+                title="Market Summary (on start)",
+                description=f"Bullish={len(bull_syms)} | Bearish={len(bear_syms)} | Neutral={len(neutral_syms)}",
+                color=color_neutral,
+                fields=[
+                    {"name": "Bullish", "value": ", ".join(bull_syms) or "(none)", "inline": False},
+                    {"name": "Bearish", "value": ", ".join(bear_syms) or "(none)", "inline": False},
+                    {"name": "Neutral", "value": ", ".join(neutral_syms) or "(none)", "inline": False},
+                    {"name": "Bars Returned (per symbol)", "value": ", ".join([f"{s}:{n}" for s, n in bar_counts_ordered]) or "(none)", "inline": False},
+                ],
+            ))
+            if plan_lines:
+                joined = "\n".join(plan_lines)
+                if len(joined) > 1800:
+                    joined = joined[:1800] + "\n..."
+                _send_once(webhook, f"MARKET_PLAN_START:{today_et()}", {
+                    "embeds": [{
+                        "title": "Plan (on start)",
+                        "description": f"```\n{joined}\n```",
+                    }]
+                })
+    except Exception as e:
+        logger.error({"event": "market_summary_error", "err": str(e)})
 
     # Deep readiness check → Ready/Not Ready embed
     ready_fields: List[dict] = []
@@ -187,6 +755,8 @@ def run_self_test(cfg: Dict[str, Any]) -> None:
             fields=ready_fields,
         ))
 
+    # (removed duplicate midday Market Summary block; handled earlier with detailed summary)
+
     # Weekend idle note
     if now_et().weekday() >= 5 and webhook:
         _send_once(webhook, f"WEEKEND:{today_et()}", build_info_embed(
@@ -237,6 +807,8 @@ def run_premarket(cfg: Dict[str, Any]) -> None:
     # Trading logic
     sig_cfg = cfg.get("signals", {})
     sma_long = int(sig_cfg.get("sma_long", 50))
+    # Ensure we fetch ample history to compute reliable SMAs
+    lookback_bars = int(sig_cfg.get("bars_lookback", max(sma_long + 50, 150)))
     lookback_iv_days = int(sig_cfg.get("iv_percentile_lookback_days", 90))
     lo_thr = float(sig_cfg.get("iv_low_threshold_pctile", 30))
     hi_thr = float(sig_cfg.get("iv_high_threshold_pctile", 70))
@@ -284,6 +856,7 @@ def run_premarket(cfg: Dict[str, Any]) -> None:
     bull_syms: List[str] = []
     bear_syms: List[str] = []
     neutral_syms: List[str] = []
+    plan_lines: List[str] = []  # Per-symbol plan summary to post to Discord
     placed_count = 0
     spent_budget = 0.0
     # Strict open-risk cap (sum of entry_debit for OPEN positions)
@@ -305,7 +878,7 @@ def run_premarket(cfg: Dict[str, Any]) -> None:
             if current_positions + placed_count >= max_positions:
                 break
             # Trend via SMA20/50
-            bars = md.daily_bars(sym, lookback=max(sma_long + 5, 60))
+            bars = md.daily_bars(sym, lookback=lookback_bars)
             closes = [b.get("close") for b in bars if b.get("close") is not None]
             if len(closes) < sma_long:
                 continue
@@ -317,6 +890,8 @@ def run_premarket(cfg: Dict[str, Any]) -> None:
             direction = "BULL" if sma20 > sma50 else ("BEAR" if sma20 < sma50 else "NEUTRAL")
             if direction == "NEUTRAL":
                 neutral_syms.append(sym)
+                # Capture plan line with no-entry rationale
+                plan_lines.append(f"{sym} NEUTRAL -> (no trade)")
                 continue
             (bull_syms if direction == "BULL" else bear_syms).append(sym)
 
@@ -385,7 +960,11 @@ def run_premarket(cfg: Dict[str, Any]) -> None:
 
             strat = choose_strategy(SignalSnapshot(direction=direction, iv_regime=iv_regime))
             if strat is None:
+                # Should not happen for non-NEUTRAL, but guard just in case
+                plan_lines.append(f"{sym} {direction}+{iv_regime} -> (no strategy)")
                 continue
+
+            # Defer adding to plan_lines until after selection/sizing to include details
 
             # Liquidity baseline
             def _liq(occ: str, eff_spread_cap: float | None = None) -> bool:
@@ -414,18 +993,22 @@ def run_premarket(cfg: Dict[str, Any]) -> None:
                                           bid=q.get("bid_price"), ask=q.get("ask_price"), mid=_mid(c["symbol"]) or 0.0))
                 pick = pick_single_delta_band(cands, d_lo, d_hi)
                 if not pick:
+                    plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} exp={expiry} (no contract in Δ[{d_lo:.2f},{d_hi:.2f}])")
                     continue
                 s = snaps.get(pick.symbol, {}); q = s.get("latest_quote", {})
                 oi = s.get("open_interest") or 0; vol = s.get("day", {}).get("volume") or 0
                 # Dynamic spread cap: tighten to 5% when premium < $0.80
                 eff_cap = 0.05 if (pick.mid or 0.0) < 0.80 else max_spread_pct
-                if not passes_liquidity(oi, vol, q.get("bid_price"), q.get("ask_price"), eff_cap):
+                if not _liq(pick.symbol, eff_cap):
+                    plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} K={pick.strike:g} (illiquid by spread/OI/Vol)")
                     continue
                 debit = pick.mid or 0.0
                 if debit <= 0 or debit < min_premium:
+                    plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} K={pick.strike:g} (debit ${debit:.2f} < min ${min_premium:.2f})")
                     continue
                 qty = int(max(1, per_max // (debit * 100)))
                 if qty < 1 or (debit * 100) < per_min:
+                    plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} K={pick.strike:g} (budget too small)")
                     continue
                 legs = [{"symbol": pick.symbol, "side": "buy", "qty": qty}]
                 limit_price = round(debit, 2)
@@ -433,9 +1016,11 @@ def run_premarket(cfg: Dict[str, Any]) -> None:
                 # Strict open-risk cap gate
                 if (open_risk_sum + net_cost) > open_risk_cap_abs:
                     # skip due to open-risk cap
+                    plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} K={pick.strike:g} (skipped: open risk cap)")
                     continue
             else:
                 if atm_call_mid is None or atm_put_mid is None:
+                    plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} (missing ATM quotes)")
                     continue
                 im = implied_move_abs(atm_call_mid, atm_put_mid) or width_default
                 if direction == "BULL":
@@ -453,13 +1038,16 @@ def run_premarket(cfg: Dict[str, Any]) -> None:
                     if short_pool and _liq_leg(short_pool[0]):
                         short_leg = short_pool[0]
                 if not short_leg:
+                    plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} (no viable short leg)")
                     continue
                 long_mid = _mid(long_leg["symbol"]) or 0.0
                 short_mid = _mid(short_leg["symbol"]) or 0.0
                 if long_mid <= 0 or short_mid <= 0:
+                    plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} (bad quotes for legs)")
                     continue
                 net_debit = max(0.0, long_mid - short_mid)
                 if net_debit < min_premium or not (per_min <= net_debit * 100 <= per_max):
+                    plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} (debit ${net_debit:.2f} outside budget)")
                     continue
                 qty = 1
                 legs = [
@@ -470,6 +1058,7 @@ def run_premarket(cfg: Dict[str, Any]) -> None:
                 net_cost = net_debit * 100.0 * qty
                 # Strict open-risk cap gate
                 if (open_risk_sum + net_cost) > open_risk_cap_abs:
+                    plan_lines.append(f"{sym} {direction}+{iv_regime} -> {strat} (skipped: open risk cap)")
                     continue
 
             # Risk checks vs cash/BP and positions
@@ -477,6 +1066,25 @@ def run_premarket(cfg: Dict[str, Any]) -> None:
             if net_cost > available_cash or net_cost > buying_power:
                 continue
 
+            # Submit (and add detailed plan line just before submit)
+            try:
+                if strat in ("CALL", "PUT"):
+                    plan_lines.append(
+                        f"{sym} {direction}+{iv_regime} -> {strat} exp={expiry} K={pick.strike:g} Δ={(pick.delta or 0):.2f} mid=${limit_price:.2f} qty={qty} est_cost=${net_cost:,.2f}"
+                    )
+                else:
+                    try:
+                        k_long = float(long_leg.get("strike_price")); k_short = float(short_leg.get("strike_price"))
+                        width = abs(k_short - k_long)
+                        plan_lines.append(
+                            f"{sym} {direction}+{iv_regime} -> {strat} exp={expiry} Klong={k_long:g} Kshort={k_short:g} width=${width:.2f} debit=${limit_price:.2f} qty={qty} est_cost=${net_cost:,.2f}"
+                        )
+                    except Exception:
+                        plan_lines.append(
+                            f"{sym} {direction}+{iv_regime} -> {strat} exp={expiry} debit=${limit_price:.2f} qty={qty} est_cost=${net_cost:,.2f}"
+                        )
+            except Exception:
+                pass
             # Submit
             try:
                 resp = orders.submit_options_order(legs=legs, limit_price=limit_price)
@@ -555,6 +1163,18 @@ def run_premarket(cfg: Dict[str, Any]) -> None:
             description=f"Bullish={len(bull_syms)} | Bearish={len(bear_syms)} | Neutral={len(neutral_syms)}",
             color=color_neutral,
         ))
+        # Premarket plan rundown (per symbol)
+        if plan_lines:
+            # Keep message within Discord limits; truncate if too long
+            joined = "\n".join(plan_lines)
+            if len(joined) > 1800:
+                joined = joined[:1800] + "\n..."
+            _send_once(webhook, f"PREMARKET_PLAN:{today_et()}", {
+                "embeds": [{
+                    "title": "Premarket Plan",
+                    "description": f"```\n{joined}\n```",
+                }]
+            })
 
 
 def run_intraday(cfg: Dict[str, Any]) -> None:
@@ -579,7 +1199,8 @@ def run_intraday(cfg: Dict[str, Any]) -> None:
         logger.error({"event": "intraday_positions_error", "err": str(e)})
         return
     if not open_positions:
-        return
+        # Even if there are no open positions, we may still want to place new ones if enabled
+        pass
 
     # Collect OCC symbols for singles
     occs: List[str] = []
@@ -763,7 +1384,6 @@ def run_intraday(cfg: Dict[str, Any]) -> None:
             # Hard stop: -50% of debit (curr <= 0.5 * entry)
             elif entry > 0 and curr_val <= (entry * (1.0 - float(cfg.get("exits", {}).get("single_hard_stop_pct", 0.5)))):
                 exit_reason = "HS_SPREAD -50%"
-                exit_reason = "HS_SPREAD -50%"
             # Time stop
             elif days_held >= int(cfg.get("exits", {}).get("time_stop_days_max", 5)):
                 exit_reason = f"TIME_STOP {days_held}d"
@@ -871,6 +1491,388 @@ def run_intraday(cfg: Dict[str, Any]) -> None:
         except Exception as e:
             logger.error({"event": "spread_exit_error", "pos_id": getattr(p, 'id', None), "err": str(e)})
 
+    # Optional: intraday entries (reuses premarket logic, guarded by config and market window)
+    try:
+        sched = cfg.get("scheduling", {})
+        intraday_entries_enabled = bool(sched.get("intraday_entries_enabled", True))
+        window = str(sched.get("intraday_entry_window", "09:40-15:30"))
+        def _parse_window(w: str) -> tuple[dtime, dtime]:
+            try:
+                s, e = w.split("-")
+                sh, sm = [int(x) for x in s.split(":")]
+                eh, em = [int(x) for x in e.split(":")]
+                return dtime(hour=sh, minute=sm), dtime(hour=eh, minute=em)
+            except Exception:
+                return dtime(hour=9, minute=40), dtime(hour=15, minute=30)
+        start_w, end_w = _parse_window(window)
+        now = now_et()
+        if intraday_entries_enabled and _et_between(now, start_w, end_w) and now.weekday() < 5:
+            try:
+                run_intraday_entries(cfg)
+            except Exception as e:
+                logger.error({"event": "intraday_entries_error", "err": str(e)})
+    except Exception as e:
+        logger.error({"event": "intraday_entries_setup_error", "err": str(e)})
+
+
+def run_intraday_entries(cfg: Dict[str, Any]) -> None:
+    """Entry scan during market hours. Mirrors premarket entry logic with lighter messaging."""
+    _, md, oc, orders, acct = _build_clients(cfg)
+    disc = cfg.get("discord", {})
+    webhook = disc.get("trades_webhook")
+    color_neutral = int(disc.get("color_neutral", 15844367))
+
+    # Universe
+    uni_cfg = cfg.get("universe", {})
+    top_n = int(uni_cfg.get("top_n", 15))
+    exclude = uni_cfg.get("exclude", [])
+    symbols = md.most_actives(top_n=top_n, exclude=exclude)
+    if not symbols:
+        static = uni_cfg.get("static", [])
+        if static:
+            symbols = [s for s in static if s not in exclude][:top_n]
+
+    # Trading logic (same config as premarket)
+    sig_cfg = cfg.get("signals", {})
+    sma_long = int(sig_cfg.get("sma_long", 50))
+    lookback_iv_days = int(sig_cfg.get("iv_percentile_lookback_days", 90))
+    lo_thr = float(sig_cfg.get("iv_low_threshold_pctile", 30))
+    hi_thr = float(sig_cfg.get("iv_high_threshold_pctile", 70))
+
+    strat_cfg = cfg.get("strategy", {})
+    dmin = int(strat_cfg.get("expiry_min_days", 7))
+    dmax = int(strat_cfg.get("expiry_max_days", 21))
+    d_lo = float(strat_cfg.get("single_delta_min", 0.35))
+    d_hi = float(strat_cfg.get("single_delta_max", 0.55))
+    width_default = float(strat_cfg.get("spread_width_default", 5.0))
+    use_im_cap = bool(strat_cfg.get("use_implied_move_for_cap", True))
+
+    liq = cfg.get("liquidity", {})
+    min_oi = int(liq.get("min_open_interest", 500))
+    min_vol = int(liq.get("min_volume", 50))
+    max_spread_pct = float(liq.get("max_spread_pct", 0.10))
+
+    risk_cfg = cfg.get("risk", {})
+    per_min = float(risk_cfg.get("per_trade_dollar_min", 50))
+    per_max = float(risk_cfg.get("per_trade_dollar_max", 200))
+    min_premium = float(risk_cfg.get("min_premium", 0.4))
+    max_positions = int(risk_cfg.get("max_concurrent_positions", 4))
+
+    # Account snapshot
+    def _to_float(v, default=0.0):
+        try:
+            return default if v is None else float(v)
+        except Exception:
+            return default
+    try:
+        a = acct.account()
+    except Exception:
+        a = {}
+    cash = _to_float(a.get("cash"), 0.0)
+    equity = _to_float(a.get("equity"), cash)
+    buying_power = _to_float(a.get("buying_power"), cash)
+    try:
+        broker_positions = acct.positions()
+    except Exception:
+        broker_positions = []
+    def _is_opt(p: dict) -> bool:
+        return (str(p.get("asset_class") or "").lower() == "option") or len(str(p.get("symbol") or "")) >= 15
+    current_positions = len([p for p in broker_positions if isinstance(p, dict) and _is_opt(p)])
+
+    placed_count = 0
+    spent_budget = 0.0
+    open_risk_cap_abs = (float(cfg.get("risk", {}).get("max_open_risk_pct_of_equity", 40)) / 100.0) * max(equity, 0.0)
+    try:
+        for session in get_session():
+            from sqlalchemy import func as _func
+            open_risk_now = session.query(_func.coalesce(_func.sum(Position.entry_debit), 0.0)).filter(Position.status == PositionStatus.OPEN).scalar()
+            open_risk_sum = float(open_risk_now or 0.0)
+            break
+    except Exception:
+        open_risk_sum = 0.0
+
+    import pandas as pd
+
+    for sym in symbols:
+        try:
+            if current_positions + placed_count >= max_positions:
+                break
+            # Trend via SMA20/50
+            bars = md.daily_bars(sym, lookback=max(sma_long + 5, 150))
+            closes = [b.get("close") for b in bars if b.get("close") is not None]
+            if len(closes) < sma_long:
+                continue
+            df = compute_sma20_50(pd.DataFrame({"close": closes}))
+            sma20 = float(df["sma20"].iloc[-1]) if pd.notnull(df["sma20"].iloc[-1]) else None
+            sma50 = float(df["sma50"].iloc[-1]) if pd.notnull(df["sma50"].iloc[-1]) else None
+            if sma20 is None or sma50 is None:
+                continue
+            direction = "BULL" if sma20 > sma50 else ("BEAR" if sma20 < sma50 else "NEUTRAL")
+            if direction == "NEUTRAL":
+                continue
+
+            # Spot
+            spot = md.latest_trade_price(sym)
+            if spot is None:
+                continue
+            # Contracts near DTE window
+            cons = oc.contracts(sym, dmin, dmax)
+            if not cons:
+                cons = oc.contracts(sym, dmin, 28)
+            cons = [c for c in cons if c.get("expiration_date")]
+            if not cons:
+                continue
+            from datetime import datetime as _dt, date as _date
+            def _dte(exp: str) -> int:
+                try:
+                    d = _dt.fromisoformat(exp).date()
+                except Exception:
+                    d = _date.fromisoformat(exp)
+                return (d - _date.today()).days
+            cons.sort(key=lambda c: abs(_dte(c["expiration_date"])) )
+            expiry = cons[0]["expiration_date"]
+            same_exp = [c for c in cons if c.get("expiration_date") == expiry]
+            same_exp.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - spot))
+            focus = same_exp[:30]
+            occ_syms = [c.get("symbol") for c in focus if c.get("symbol")]
+            snaps = oc.snapshots(occ_syms)
+
+            # Helpers
+            def _mid(occ: str) -> float | None:
+                s = snaps.get(occ, {})
+                q = s.get("latest_quote", {})
+                bp, ap = q.get("bid_price"), q.get("ask_price")
+                if not bp or not ap or bp <= 0 or ap <= 0:
+                    return None
+                return (bp + ap) / 2.0
+            def _iv(occ: str) -> float | None:
+                s = snaps.get(occ, {}); g = s.get("greeks", {}); v = g.get("iv"); return float(v) if v is not None else None
+
+            calls = [c for c in focus if c.get("type") == "call"]
+            puts = [c for c in focus if c.get("type") == "put"]
+            calls.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - spot))
+            puts.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - spot))
+            atm_call = calls[0] if calls else None
+            atm_put = puts[0] if puts else None
+            if not atm_call or not atm_put:
+                continue
+            atm_call_mid = _mid(atm_call["symbol"]) if atm_call else None
+            atm_put_mid = _mid(atm_put["symbol"]) if atm_put else None
+
+            iv_vals = [v for v in (_iv(atm_call["symbol"]), _iv(atm_put["symbol"])) if v is not None]
+            atm_iv = sum(iv_vals) / len(iv_vals) if iv_vals else None
+            # Store IV percentile
+            pct = None
+            try:
+                for session in get_session():
+                    _, pct = upsert_iv_summary(session, sym, today_et(), float(atm_call.get("strike_price")) if atm_call else None,
+                                               _dt.fromisoformat(expiry).date() if isinstance(expiry, str) else expiry,
+                                               atm_iv, lookback_iv_days)
+                    break
+            except Exception:
+                pct = None
+            iv_regime = "MID" if pct is None else ("LOW" if pct <= lo_thr else ("HIGH" if pct >= hi_thr else "MID"))
+
+            strat = choose_strategy(SignalSnapshot(direction=direction, iv_regime=iv_regime))
+            if strat is None:
+                continue
+
+            # Liquidity helper: enforce quotes/spread cap; only enforce OI/Vol if present
+            def _liq(occ: str, eff_spread_cap: float | None = None) -> bool:
+                s = snaps.get(occ, {})
+                q = s.get("latest_quote", {})
+                bid = q.get("bid_price"); ask = q.get("ask_price")
+                cap = max_spread_pct if eff_spread_cap is None else eff_spread_cap
+                if not bid or not ask or bid <= 0 or ask <= 0:
+                    return False
+                mid = (bid + ask) / 2.0
+                if mid <= 0:
+                    return False
+                if abs(ask - bid) / mid > cap:
+                    return False
+                oi = s.get("open_interest")
+                vol = (s.get("day", {}) or {}).get("volume")
+                if oi is not None and oi < min_oi:
+                    return False
+                if vol is not None and vol < min_vol:
+                    return False
+                return True
+
+            order_color = int(disc.get("color_bullish", 3066993)) if direction == "BULL" else int(disc.get("color_bearish", 15158332))
+            title = f"[NEW] {sym} {strat} ({expiry})"
+            desc = f"Strategy: {strat}; Reason: {direction}+{iv_regime}"
+
+            legs: List[Dict[str, Any]] = []
+            limit_price = 0.0
+            net_cost = 0.0
+
+            if strat in ("CALL", "PUT"):
+                side_list = calls if strat == "CALL" else puts
+                cands: List[Contract] = []
+                for c in side_list:
+                    s = snaps.get(c["symbol"], {}); g = s.get("greeks", {}); q = s.get("latest_quote", {})
+                    cands.append(Contract(symbol=c["symbol"], expiry=expiry, strike=float(c.get("strike_price", 0.0)),
+                                          type=("C" if c.get("type") == "call" else "P"), delta=g.get("delta"),
+                                          bid=q.get("bid_price"), ask=q.get("ask_price"), mid=_mid(c["symbol"]) or 0.0))
+                pick = pick_single_delta_band(cands, d_lo, d_hi)
+                if not pick:
+                    continue
+                eff_cap = 0.05 if (pick.mid or 0.0) < 0.80 else max_spread_pct
+                # Use the same liquidity helper logic as premarket (allow missing OI/Vol if spread is tight)
+                def _liq_pick(sym_occ: str, cap: float) -> bool:
+                    s2 = snaps.get(sym_occ, {})
+                    q2 = s2.get("latest_quote", {})
+                    bid = q2.get("bid_price"); ask = q2.get("ask_price")
+                    if not bid or not ask or bid <= 0 or ask <= 0:
+                        return False
+                    mid2 = (bid + ask) / 2.0
+                    if mid2 <= 0:
+                        return False
+                    if abs(ask - bid) / mid2 > cap:
+                        return False
+                    oi2 = s2.get("open_interest"); vol2 = (s2.get("day", {}) or {}).get("volume")
+                    if oi2 is not None and oi2 < min_oi:
+                        return False
+                    if vol2 is not None and vol2 < min_vol:
+                        return False
+                    return True
+                if not _liq_pick(pick.symbol, eff_cap):
+                    continue
+                debit = pick.mid or 0.0
+                if debit <= 0 or debit < min_premium:
+                    continue
+                qty = int(max(1, per_max // (debit * 100)))
+                if qty < 1 or (debit * 100) < per_min:
+                    continue
+                legs = [{"symbol": pick.symbol, "side": "buy", "qty": qty}]
+                limit_price = round(debit, 2)
+                net_cost = debit * 100.0 * qty
+                if (open_risk_sum + net_cost) > open_risk_cap_abs:
+                    continue
+            else:
+                if atm_call_mid is None or atm_put_mid is None:
+                    continue
+                im = implied_move_abs(atm_call_mid, atm_put_mid) or width_default
+                if direction == "BULL":
+                    long_leg = atm_call; target = spot + (im if use_im_cap else width_default); short_pool = calls
+                else:
+                    long_leg = atm_put; target = spot - (im if use_im_cap else width_default); short_pool = puts
+                short_pool.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - target))
+                short_leg = short_pool[0] if short_pool else None
+                def _liq_leg(c: dict) -> bool:
+                    s2 = snaps.get(c["symbol"], {})
+                    q2 = s2.get("latest_quote", {})
+                    bid = q2.get("bid_price"); ask = q2.get("ask_price")
+                    if not bid or not ask or bid <= 0 or ask <= 0:
+                        return False
+                    mid2 = (bid + ask) / 2.0
+                    if mid2 <= 0:
+                        return False
+                    if abs(ask - bid) / mid2 > max_spread_pct:
+                        return False
+                    oi2 = s2.get("open_interest"); vol2 = (s2.get("day", {}) or {}).get("volume")
+                    if oi2 is not None and oi2 < min_oi:
+                        return False
+                    if vol2 is not None and vol2 < min_vol:
+                        return False
+                    return True
+                if not short_leg or not _liq_leg(short_leg):
+                    alt = spot + (width_default if direction == "BULL" else -width_default)
+                    short_pool.sort(key=lambda c: abs(float(c.get("strike_price", 0)) - alt))
+                    if short_pool and _liq_leg(short_pool[0]):
+                        short_leg = short_pool[0]
+                if not short_leg:
+                    continue
+                long_mid = _mid(long_leg["symbol"]) or 0.0
+                short_mid = _mid(short_leg["symbol"]) or 0.0
+                if long_mid <= 0 or short_mid <= 0:
+                    continue
+                net_debit = max(0.0, long_mid - short_mid)
+                if net_debit < min_premium or not (per_min <= net_debit * 100 <= per_max):
+                    continue
+                qty = 1
+                legs = [
+                    {"symbol": long_leg["symbol"], "side": "buy", "qty": qty},
+                    {"symbol": short_leg["symbol"], "side": "sell", "qty": qty},
+                ]
+                limit_price = round(net_debit, 2)
+                net_cost = net_debit * 100.0 * qty
+                if (open_risk_sum + net_cost) > open_risk_cap_abs:
+                    continue
+
+            available_cash = max(0.0, cash - spent_budget)
+            if net_cost > available_cash or net_cost > buying_power:
+                continue
+
+            try:
+                resp = orders.submit_options_order(legs=legs, limit_price=limit_price)
+            except Exception as e:
+                logger.error({"event": "order_submit_error_intraday", "symbol": sym, "err": str(e)})
+                continue
+            order_id = resp.get("id", "")
+            placed_count += 1
+            spent_budget += net_cost
+            open_risk_sum += net_cost
+
+            try:
+                for session in get_session():
+                    structure = (
+                        PositionStructure.CALL if strat == "CALL" else
+                        PositionStructure.PUT if strat == "PUT" else
+                        PositionStructure.BULL_CALL_SPREAD if strat == "BULL_CALL_SPREAD" else
+                        PositionStructure.BEAR_PUT_SPREAD
+                    )
+                    pos = Position(
+                        ticker=sym,
+                        structure=structure,
+                        legs_json=legs,
+                        opened_at=now_et(),
+                        status=PositionStatus.OPEN,
+                        entry_debit=net_cost,
+                        notes=f"dir={direction}; iv_regime={iv_regime}; expiry={expiry}",
+                    )
+                    session.add(pos)
+                    break
+            except Exception as e:
+                logger.error({"event": "persist_position_error_intraday", "symbol": sym, "err": str(e)})
+
+            if webhook:
+                cash_after = max(0.0, cash - spent_budget)
+                bp_after = max(0.0, buying_power - net_cost)
+                slots_left = max(0, max_positions - (current_positions + placed_count))
+                _send_once(webhook, f"NEW_INTRADAY:{order_id}", build_trade_new_embed(
+                    title=title,
+                    description=desc,
+                    color=order_color,
+                    fields=[
+                        {"name": "Order ID", "value": order_id or "(pending)", "inline": True},
+                        {"name": "Net Cost", "value": f"${net_cost:,.2f}", "inline": True},
+                        {"name": "Cash Remaining", "value": f"${cash_after:,.2f}", "inline": True},
+                        {"name": "BP Remaining", "value": f"${bp_after:,.2f}", "inline": True},
+                        {"name": "Slots Left", "value": str(slots_left), "inline": True},
+                    ],
+                ))
+
+            try:
+                od = orders.wait_for_status(order_id, ["filled", "partially_filled"], timeout_sec=5.0)
+                if od and webhook:
+                    fill_price = od.get("filled_avg_price") or od.get("limit_price")
+                    _send_once(webhook, f"FILLED_INTRADAY:{order_id}", build_filled_embed(
+                        title=f"[FILLED] {sym}",
+                        fields=[
+                            {"name": "Order ID", "value": order_id, "inline": True},
+                            {"name": "Fill", "value": f"${fill_price}", "inline": True},
+                            {"name": "Qty", "value": str(legs[0].get("qty", 1)), "inline": True},
+                        ],
+                        color=order_color,
+                    ))
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error({"event": "intraday_entries_symbol_error", "symbol": sym, "err": str(e)})
+            continue
+
 def run_eod(cfg: Dict[str, Any]) -> None:
     headers, md, oc, orders, acct = _build_clients(cfg)
     disc = cfg.get("discord", {})
@@ -968,7 +1970,7 @@ def run_eod(cfg: Dict[str, Any]) -> None:
                 {"name": "Unrealized", "value": f"${unreal:,.2f}", "inline": True},
                 {"name": "Total P/L", "value": f"${total_pl:,.2f}", "inline": True},
                 {"name": "Open Risk", "value": f"${open_risk:,.2f}", "inline": True},
-                {"name": "Greeks", "value": f"Δ {greeks['delta']:.2f} Θ {greeks['theta']:.2f} ν {greeks['vega']:.2f}", "inline": False},
+                {"name": "Greeks", "value": f"Delta {greeks['delta']:.2f} | Theta {greeks['theta']:.2f} | Vega {greeks['vega']:.2f}", "inline": False},
             ]
             _send_once(eod, f"EOD:{today}", {
                 "embeds": [{
@@ -997,6 +1999,56 @@ def run_eod(cfg: Dict[str, Any]) -> None:
                         "description": "\n".join(bucket_lines),
                     }]
                 })
+        # Fallback: if no DB open positions, try broker options positions to populate a basic snapshot
+        if not open_positions and eod:
+            try:
+                broker_opts = acct.options_positions()
+                occs2 = [p.get("symbol") for p in broker_opts if isinstance(p, dict) and p.get("symbol")]
+                snaps2 = oc.snapshots(occs2) if occs2 else {}
+                unreal2 = 0.0
+                open_risk2 = 0.0
+                greeks2 = {"delta": 0.0, "theta": 0.0, "vega": 0.0}
+                for bp in broker_opts:
+                    occ = bp.get("symbol"); qty = float(bp.get("qty") or bp.get("quantity") or bp.get("position_qty") or 0)
+                    side = str(bp.get("side") or bp.get("position_side") or "").lower()
+                    sgn = 1.0
+                    if side in ("short", "sell") or qty < 0:
+                        sgn = -1.0
+                    qty_abs = abs(int(qty)) if qty else 0
+                    snap = snaps2.get(occ, {})
+                    q = snap.get("latest_quote", {})
+                    bpv = q.get("bid_price"); apv = q.get("ask_price")
+                    mid = ((bpv or 0) + (apv or 0)) / 2.0 if bpv and apv else None
+                    entry_price = bp.get("avg_entry_price") or bp.get("avg_price") or bp.get("average_price")
+                    try:
+                        entry = float(entry_price) * 100.0 * qty_abs if entry_price is not None else 0.0
+                    except Exception:
+                        entry = 0.0
+                    curr = (float(mid) * 100.0 * qty_abs) if (mid and qty_abs) else 0.0
+                    open_risk2 += max(0.0, entry)
+                    unreal2 += (sgn * (curr - entry))
+                    g = snap.get("greeks", {}) if isinstance(snap, dict) else {}
+                    greeks2["delta"] += sgn * float(g.get("delta") or 0.0) * qty_abs
+                    greeks2["theta"] += sgn * float(g.get("theta") or 0.0) * qty_abs
+                    greeks2["vega"] += sgn * float(g.get("vega") or 0.0) * qty_abs
+                total_pl2 = unreal2  # realized unknown from broker snapshot
+                fields2 = [
+                    {"name": "Cash", "value": f"${cash:,.2f}", "inline": True},
+                    {"name": "Equity", "value": f"${equity:,.2f}", "inline": True},
+                    {"name": "Unrealized (broker)", "value": f"${unreal2:,.2f}", "inline": True},
+                    {"name": "Open Risk (broker)", "value": f"${open_risk2:,.2f}", "inline": True},
+                    {"name": "Greeks (broker)", "value": f"Delta {greeks2['delta']:.2f} | Theta {greeks2['theta']:.2f} | Vega {greeks2['vega']:.2f}", "inline": False},
+                ]
+                _send_once(eod, f"EOD_BROKER:{today}", {
+                    "embeds": [{
+                        "title": "EOD Summary (Broker Fallback)",
+                        "description": "Broker options positions snapshot (no DB positions found)",
+                        "fields": fields2,
+                    }]
+                })
+            except Exception as _e:
+                logger.error({"event": "eod_broker_fallback_error", "err": str(_e)})
+
     except Exception as e:
         logger.error({"event": "eod_error", "err": str(e)})
 
@@ -1024,6 +2076,15 @@ def run_daemon(cfg: Dict[str, Any]) -> None:
     pre_mh = _parse_cron_min_hour(sched.get("premarket_cron", "0 8 * * 1-5")) or (0, 8)
     eod_mh = _parse_cron_min_hour(sched.get("eod_cron", "15 16 * * 1-5")) or (15, 16)
     intraday_every = int(sched.get("intraday_every_seconds", 120))
+    # Prefer minutes if provided; fallback to seconds; default 5 minutes
+    _syn_minutes = sched.get("intraday_synopsis_every_minutes")
+    if _syn_minutes is not None:
+        try:
+            synopsis_every = int(float(_syn_minutes) * 60)
+        except Exception:
+            synopsis_every = 300
+    else:
+        synopsis_every = int(sched.get("intraday_synopsis_every_seconds", 300))
 
     pre_start = dtime(hour=pre_mh[1], minute=pre_mh[0])
     market_open = dtime(hour=9, minute=30)
@@ -1031,6 +2092,7 @@ def run_daemon(cfg: Dict[str, Any]) -> None:
     market_close_guard = dtime(hour=18, minute=0)
 
     last_intraday_ts: float | None = None
+    last_synopsis_ts: float | None = None
     premarket_done_for: str | None = None
     eod_done_for: str | None = None
 
@@ -1042,8 +2104,54 @@ def run_daemon(cfg: Dict[str, Any]) -> None:
         "intraday_every": intraday_every,
     })
 
+    # Track config file mtime for hot-reload
+    cfg_path = Path("config.yaml")
     try:
+        last_cfg_mtime = cfg_path.stat().st_mtime if cfg_path.exists() else None
+    except Exception:
+        last_cfg_mtime = None
+
+    try:
+        # Optional: import existing broker options positions once at start
+        sync_cfg = cfg.get("sync", {})
+        if bool(sync_cfg.get("broker_positions_on_start", True)):
+            try:
+                imported = sync_broker_positions_to_db(cfg)
+                if imported > 0:
+                    logger.info({"event": "sync_broker_positions", "imported": imported})
+            except Exception as e:
+                logger.error({"event": "sync_broker_positions_error", "err": str(e)})
+
         while True:
+            # Hot-reload config.yaml if modified; apply timezone if changed
+            try:
+                mtime = cfg_path.stat().st_mtime if cfg_path.exists() else None
+                if mtime and last_cfg_mtime and mtime > last_cfg_mtime:
+                    new_cfg = load_config(cfg_path)
+                    # Update timezone immediately if changed
+                    try:
+                        tz_name = new_cfg.get("timezone", cfg.get("timezone", "America/New_York"))
+                        set_local_tz(tz_name)
+                    except Exception:
+                        pass
+                    cfg = new_cfg  # use updated config for subsequent phases
+                    sched = cfg.get("scheduling", {})
+                    intraday_every = int(sched.get("intraday_every_seconds", intraday_every))
+                    _syn_minutes = sched.get("intraday_synopsis_every_minutes")
+                    if _syn_minutes is not None:
+                        try:
+                            synopsis_every = int(float(_syn_minutes) * 60)
+                        except Exception:
+                            pass
+                    else:
+                        synopsis_every = int(sched.get("intraday_synopsis_every_seconds", synopsis_every))
+                    last_cfg_mtime = mtime
+                    logger.info({"event": "config_reloaded"})
+                elif mtime and last_cfg_mtime is None:
+                    last_cfg_mtime = mtime
+            except Exception as e:
+                logger.error({"event": "config_reload_error", "err": str(e)})
+
             now = now_et()
             today_key = str(today_et())
 
@@ -1074,6 +2182,14 @@ def run_daemon(cfg: Dict[str, Any]) -> None:
                         run_intraday(cfg)
                     finally:
                         last_intraday_ts = ts
+                # Periodic intraday synopsis (non-blocking if it fails)
+                if last_synopsis_ts is None or (ts - last_synopsis_ts) >= synopsis_every:
+                    try:
+                        post_intraday_synopsis(cfg)
+                    except Exception as e:
+                        logger.error({"event": "intraday_synopsis_error", "err": str(e)})
+                    finally:
+                        last_synopsis_ts = ts
                 time.sleep(1)
                 continue
 

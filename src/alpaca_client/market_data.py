@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -33,20 +33,53 @@ class MarketDataClient:
 
     def daily_bars(self, symbol: str, lookback: int = 100) -> List[Dict[str, Any]]:
         # v2 per-symbol bars endpoint
+        # Provide explicit start/end to avoid API defaults that can yield a single bar
+        end = datetime.now(timezone.utc)
+        # Request a wide date range to comfortably cover `lookback` bars even with gaps/holidays
+        start = end - timedelta(days=max(lookback * 3, 365))
+        start_iso = start.isoformat().replace("+00:00", "Z")
+        end_iso = end.isoformat().replace("+00:00", "Z")
         data = self._get(
             f"/v2/stocks/{symbol}/bars",
-            params={"timeframe": "1Day", "limit": lookback, "feed": self.stocks_feed},
+            params={
+                "timeframe": "1Day",
+                "limit": lookback,
+                "start": start_iso,
+                "end": end_iso,
+                "adjustment": "raw",
+                "feed": self.stocks_feed,
+            },
         )
         bars = data.get("bars") or []
-        # Normalize
-        return [
+        # Normalize then sort chronologically (oldest -> newest) to ensure SMA windows align correctly
+        rows = [
             {
                 "t": b.get("t"),
                 "close": b.get("c"),
                 "volume": b.get("v"),
             }
             for b in bars
+            if b is not None
         ]
+        # Robust sort: parse ISO strings or use numeric epoch if provided
+        def _ts_key(v):
+            t = v.get("t")
+            try:
+                if isinstance(t, (int, float)):
+                    return float(t)
+                if isinstance(t, str):
+                    # Handle 'Z' suffix
+                    s = t.replace("Z", "+00:00")
+                    return datetime.fromisoformat(s).timestamp()
+            except Exception:
+                return 0.0
+            return 0.0
+        try:
+            rows.sort(key=_ts_key)
+        except Exception:
+            # Best-effort: if timestamp shape is unexpected, leave order as-is
+            pass
+        return rows
 
     def latest_trade_price(self, symbol: str) -> Optional[float]:
         try:
