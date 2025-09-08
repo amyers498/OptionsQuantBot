@@ -4,11 +4,14 @@ timezone: "America/New_York"
 alpaca:
   base_url_paper: "https://paper-api.alpaca.markets"
   data_url: "https://data.alpaca.markets"
-  market_data_subscription: "iex" # or sip, if entitled
+  market_data_subscription: "iex"   # equities feed: iex or sip
+  options_feed: "indicative"        # options feed: indicative or opra (if entitled)
+  contracts_source: "auto"          # auto | trading | data
 
 universe:
   top_n: 15        # pull 10–20 candidates daily
   exclude: ["BIOTECH_X", "PENNY_Y"]  # optional blacklist
+  static: []       # optional static fallback universe when data API unavailable
 
 signals:
   sma_short: 20
@@ -34,6 +37,7 @@ risk:
   account_size_assumed: 500
   per_trade_dollar_min: 50
   per_trade_dollar_max: 200
+  min_premium: 0.4
   max_concurrent_positions: 4
   daily_loss_limit_pct: 5
   max_open_risk_pct_of_equity: 40
@@ -57,4 +61,3 @@ scheduling:
   premarket_cron: "0 8 * * 1-5"      # 8:00 ET
   intraday_every_seconds: 120        # poll 2 min
   eod_cron: "15 16 * * 1-5"          # 4:15 ET
-

@@ -29,8 +29,10 @@ def main() -> None:
     _init_env()
 
     parser = argparse.ArgumentParser(description="Alpaca Options Quant — Paper Trader")
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(dest="cmd")
 
+    sub.add_parser("run", help="Run long-lived scheduler (auto phases)")
+    sub.add_parser("preflight", help="Run self-test probes and exit")
     sub.add_parser("premarket", help="Run premarket workflow")
     sub.add_parser("intraday", help="Run intraday polling loop once")
     sub.add_parser("eod", help="Run end-of-day workflow")
@@ -44,13 +46,31 @@ def main() -> None:
     if env != "paper":
         logger.warning("Non-paper env configured. Ensure live trading is disabled!")
 
-    if args.cmd == "premarket":
+    # Default to 'run' if no subcommand provided
+    cmd = args.cmd or "run"
+
+    if cmd == "run":
+        logger.info("Starting daemon scheduler (auto phases)")
+        from src.scheduler.runner import run_daemon, run_self_test
+
+        # Announce and probe before entering the loop
+        try:
+            run_self_test(cfg)
+        except Exception as e:
+            logger.error({"event": "self_test_error", "err": str(e)})
+        run_daemon(cfg)
+    elif cmd == "preflight":
+        from src.scheduler.runner import run_self_test
+
+        logger.info("Running self-test and exiting")
+        run_self_test(cfg)
+    elif cmd == "premarket":
         logger.info("Starting premarket workflow")
         run_premarket(cfg)
-    elif args.cmd == "intraday":
+    elif cmd == "intraday":
         logger.info("Starting intraday workflow (single tick)")
         run_intraday(cfg)
-    elif args.cmd == "eod":
+    elif cmd == "eod":
         logger.info("Starting end-of-day workflow")
         run_eod(cfg)
     else:
@@ -59,4 +79,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

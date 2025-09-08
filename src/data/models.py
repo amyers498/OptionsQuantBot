@@ -108,6 +108,9 @@ class Position(Base):
     status = Column(Enum(PositionStatus), index=True, nullable=False, default=PositionStatus.OPEN)
     entry_debit = Column(Float, nullable=True)
     max_value = Column(Float, nullable=True)
+    direction = Column(String(8), nullable=True)
+    closed_value = Column(Float, nullable=True)
+    closed_at = Column(DateTime, nullable=True)
     targets_json = Column(JSON, nullable=True)
     notes = Column(Text, nullable=True)
 
@@ -154,4 +157,3 @@ class OrdersOutbox(Base):
     payload_json = Column(JSON, nullable=False)
     sent_at = Column(DateTime, nullable=True)
     status = Column(String(32), nullable=False, default="PENDING")
-

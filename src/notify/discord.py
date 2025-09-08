@@ -43,3 +43,44 @@ def build_trade_new_embed(**kwargs: Any) -> Dict[str, Any]:
         ],
     }
 
+
+def build_filled_embed(title: str, *, fields: list[dict], color: int | None = None) -> Dict[str, Any]:
+    return {
+        "content": None,
+        "embeds": [
+            {
+                "title": title,
+                "description": "[FILLED]",
+                "color": color or 3066993,
+                "fields": fields,
+            }
+        ],
+    }
+
+
+def build_closed_embed(title: str, *, description: str, fields: list[dict], color: int | None = None) -> Dict[str, Any]:
+    return {
+        "content": None,
+        "embeds": [
+            {
+                "title": title,
+                "description": description,
+                "color": color or 15158332,
+                "fields": fields,
+            }
+        ],
+    }
+
+
+def build_info_embed(title: str, description: str = "", *, color: int | None = None, fields: list[dict] | None = None) -> Dict[str, Any]:
+    return {
+        "content": None,
+        "embeds": [
+            {
+                "title": title,
+                "description": description,
+                "color": color or 15844367,
+                "fields": fields or [],
+            }
+        ],
+    }
